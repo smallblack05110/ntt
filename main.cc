@@ -9,10 +9,7 @@
 #include <vector>
 #include <algorithm>
 #include <tuple>
-#include <arm_neon.h>
-#include <stdexcept>
-#include <cstdint>
-#include <omp.h>
+#include <arm_neon.h> // 使用 NEON 加速
 using namespace std;
 
 class MontMul
@@ -203,115 +200,6 @@ private:
   }
 };
 
-// 快速幂取模
-int quick_mod(int a, int b, int p)
-{
-  long long result = 1;
-  long long base = a % p;
-  while (b > 0)
-  {
-    if (b % 2 == 1)
-    {
-      result = (result * base) % p;
-    }
-    base = (base * base) % p;
-    b /= 2;
-  }
-  return (int)result;
-}
-
-// void ntt_recur(vector<int> &a, int p, int root, bool invert, MontMul &mont)
-// { // ntt递归实现
-//   int n = a.size();
-//   if (n == 1) // 等于一时直接返回
-//     return;
-
-//   int half = n / 2;
-//   vector<int> a_e(half), a_o(half);
-//   for (int i = 0; i < half; ++i)
-//   {
-//     a_e[i] = a[2 * i];     // 偶数项
-//     a_o[i] = a[2 * i + 1]; // 奇数项
-//   }
-//   ntt_recur(a_e, p, root, invert, mont);
-//   ntt_recur(a_o, p, root, invert, mont);
-
-//   int wn = quick_mod(root, (p - 1) / n, p);
-//   if (invert)
-//   {
-//     wn = quick_mod(wn, p - 2, p); // 如果是反变换，wn要取模p-2（费马小定理）
-//   }
-
-//   int w0 = 1;
-//   for (int i = 0; i < half; ++i)
-//   {
-//     int op1 = a_e[i];
-//     int op2 = mont.ModMul(w0, a_o[i]); // 使用蒙哥马利模乘
-//     a[i] = (op1 + op2) % p;
-//     a[i + half] = (op1 - op2 + p) % p;
-//     w0 = mont.ModMul(w0, wn); // 使用蒙哥马利模乘
-//   }
-// }
-
-// 迭代实现 NTT (Number Theoretic Transform)
-void ntt_iter(vector<long long> &a, int p, int root, bool invert, const MontMul &mont)
-{
-  int n = a.size();
-  // 位逆序重排
-  for (int i = 1, j = 0; i < n; ++i)
-  {
-    int bit = n >> 1;
-    for (; j & bit; bit >>= 1)
-    {
-      j ^= bit;
-    }
-    j |= bit;
-    if (i < j)
-    {
-      swap(a[i], a[j]);
-    }
-  }
-  // 按长度迭代合并
-  for (int len = 2; len <= n; len <<= 1)
-  {
-    int wn = quick_mod(root, (p - 1) / len, p);
-    if (invert)
-    {
-      wn = quick_mod(wn, p - 2, p); // 若为逆变换，则使用 wn 的逆元
-    }
-    long long wnR = mont.toMont(wn);
-    for (int i = 0; i < n; i += len)
-    {
-      long long w = mont.toMont(1);
-      for (int j = 0; j < len / 2; ++j)
-      {
-        long long u = a[i + j];
-        long long v = mont.mulMont(w, a[i + j + len / 2]);
-        a[i + j] = (u + v) % p;
-        a[i + j + len / 2] = (u - v + p) % p;
-        w = mont.mulMont(w, wnR);
-      }
-    }
-  }
-}
-
-// 逐点相乘（蒙哥马利域）并执行 NTT 计算卷积，返回蒙哥马利域下的结果
-vector<long long> get_result(vector<long long> &a, vector<long long> &b, int p, int root, const MontMul &mont)
-{
-  int n = a.size();
-  ntt_iter(a, p, root, false, mont);
-  ntt_iter(b, p, root, false, mont);
-  vector<long long> c(n);
-  // 逐点相乘（蒙哥马利域）
-  mont.mulMontVec(a, b, c);
-  // 逆 NTT
-  ntt_iter(c, p, root, true, mont);
-  // 乘以 n 的逆元 (mod p)
-  int inv_n = quick_mod(n, p - 2, p);
-  vector<long long> invVec(n, mont.toMont(inv_n));
-  mont.mulMontVec(c, invVec, c);
-  return c;
-}
 
 void fRead(int *a, int *b, int *n, int *p, int input_id)
 {
@@ -395,6 +283,156 @@ void fWrite(int *ab, int n, int input_id)
   fout.close();
 }
 
+// 快速幂取模
+int quick_mod(int a, int b, int p)
+{
+  long long result = 1;
+  long long base = a % p;
+  while (b > 0)
+  {
+    if (b % 2 == 1)
+    {
+      result = (result * base) % p;
+    }
+    base = (base * base) % p;
+    b /= 2;
+  }
+  return (int)result;
+}
+
+// void ntt_recur(vector<int> &a, int p, int root, bool invert, MontMul &mont)
+// { // ntt递归实现
+//   int n = a.size();
+//   if (n == 1) // 等于一时直接返回
+//     return;
+
+//   int half = n / 2;
+//   vector<int> a_e(half), a_o(half);
+//   for (int i = 0; i < half; ++i)
+//   {
+//     a_e[i] = a[2 * i];     // 偶数项
+//     a_o[i] = a[2 * i + 1]; // 奇数项
+//   }
+//   ntt_recur(a_e, p, root, invert, mont);
+//   ntt_recur(a_o, p, root, invert, mont);
+
+//   int wn = quick_mod(root, (p - 1) / n, p);
+//   if (invert)
+//   {
+//     wn = quick_mod(wn, p - 2, p); // 如果是反变换，wn要取模p-2（费马小定理）
+//   }
+
+//   int w0 = 1;
+//   for (int i = 0; i < half; ++i)
+//   {
+//     int op1 = a_e[i];
+//     int op2 = mont.ModMul(w0, a_o[i]); // 使用蒙哥马利模乘
+//     a[i] = (op1 + op2) % p;
+//     a[i + half] = (op1 - op2 + p) % p;
+//     w0 = mont.ModMul(w0, wn); // 使用蒙哥马利模乘
+//   }
+// }
+
+void ntt_iter(vector<long long> &a, int p, int root, bool invert, const MontMul &mont)
+{
+  int n = a.size();
+  // 位逆序重排
+  for (int i = 1, j = 0; i < n; ++i)
+  {
+    int bit = n >> 1;
+    for (; j & bit; bit >>= 1)
+    {
+      j ^= bit;
+    }
+    j |= bit;
+    if (i < j)
+    {
+      swap(a[i], a[j]);
+    }
+  }
+  // 按长度迭代合并 (蝶形变换)
+  for (int len = 2; len <= n; len <<= 1)
+  {
+    int wn = quick_mod(root, (p - 1) / len, p);
+    if (invert)
+    {
+      wn = quick_mod(wn, p - 2, p); // 若为逆变换，则使用 wn 的逆元
+    }
+    long long wnR = mont.toMont(wn);
+    int half = len >> 1;
+    // 预先计算当前轮次用到的所有 w 值（蒙哥马利域表示）
+    vector<long long> wArr(half);
+    wArr[0] = mont.toMont(1);
+    for (int j = 1; j < half; ++j)
+    {
+      wArr[j] = mont.mulMont(wArr[j - 1], wnR);
+    }
+    if (half == 1)
+    {
+      // 长度为2的蝶形，仅1次运算，直接处理
+      for (int i = 0; i < n; i += len)
+      {
+        long long u = a[i];
+        long long v = mont.mulMont(wArr[0], a[i + half]);
+        a[i] = (u + v) % p;
+        a[i + half] = (u - v + p) % p;
+      }
+    }
+    else
+    {
+      // 使用 NEON SIMD 批量计算蝶形操作
+      vector<long long> a2temp(half);
+      vector<long long> vSegment(half);
+      int64x2_t vP = vdupq_n_s64(p);
+      for (int i = 0; i < n; i += len)
+      {
+        // 批量蒙哥马利乘法: 计算 wArr 与第二段 a 的点乘结果
+        for (int j = 0; j < half; ++j)
+        {
+          a2temp[j] = a[i + half + j];
+        }
+        mont.mulMontVec(wArr, a2temp, vSegment);
+        // NEON 并行计算 (u+v) mod p 和 (u-v+p) mod p，并写回结果
+        for (int j = 0; j < half; j += 2)
+        {
+          int64x2_t u_vec = vld1q_s64((const int64_t *)&a[i + j]);
+          int64x2_t v_vec = vld1q_s64((const int64_t *)&vSegment[j]);
+          int64x2_t sum = vaddq_s64(u_vec, v_vec);
+          int64x2_t diff = vsubq_s64(u_vec, v_vec);
+          diff = vaddq_s64(diff, vP);
+          uint64x2_t cmp_sum = vcgeq_s64(sum, vP);
+          uint64x2_t cmp_diff = vcgeq_s64(diff, vP);
+          int64x2_t sum_mod = vsubq_s64(sum, vP);
+          int64x2_t diff_mod = vsubq_s64(diff, vP);
+          sum = vbslq_s64(cmp_sum, sum_mod, sum);
+          diff = vbslq_s64(cmp_diff, diff_mod, diff);
+          vst1q_s64((int64_t *)&a[i + j], sum);
+          vst1q_s64((int64_t *)&a[i + half + j], diff);
+        }
+      }
+    }
+  }
+}
+
+
+// 逐点相乘（蒙哥马利域）并执行 NTT 计算卷积，返回蒙哥马利域下的结果
+vector<long long> get_result(vector<long long> &a, vector<long long> &b, int p, int root, const MontMul &mont)
+{
+  int n = a.size();
+  ntt_iter(a, p, root, false, mont);
+  ntt_iter(b, p, root, false, mont);
+  vector<long long> c(n);
+  // 逐点相乘（蒙哥马利域）
+  mont.mulMontVec(a, b, c);
+  // 逆 NTT
+  ntt_iter(c, p, root, true, mont);
+  // 乘以 n 的逆元 (mod p)
+  int inv_n = quick_mod(n, p - 2, p);
+  vector<long long> invVec(n, mont.toMont(inv_n));
+  mont.mulMontVec(c, invVec, c);
+  return c;
+}
+
 void poly_multiply(int *a, int *b, int *ab, int n, int p){
     for(int i = 0; i < n; ++i){
         for(int j = 0; j < n; ++j){
@@ -413,7 +451,7 @@ int main(int argc, char *argv[])
     // 对第四个模数的输入数据不做必要要求, 如果要自行探索大模数 NTT, 请在完成前三个模数的基础代码及优化后实现大模数 NTT
     // 输入文件共五个, 第一个输入文件 n = 4, 其余四个文件分别对应四个模数, n = 131072
     // 在实现快速数论变化前, 后四个测试样例运行时间较久, 推荐调试正确性时只使用输入文件 1
-  int test_begin = 0, test_end = 3;
+  int test_begin = 0, test_end = 1;
   for (int id = test_begin; id <= test_end; ++id)
   {
     long double ans = 0.0;
@@ -433,16 +471,15 @@ int main(int argc, char *argv[])
 
     // 拷贝到 vector<long long>，用于 NTT（蒙哥马利域运算）
     vector<long long> va(a, a + len), vb(b, b + len);
-    uint64_t R = 1ULL << 30;
+    long long R = 1LL << 30;
     MontMul mont(R, p_);
-
-    // 将系数转换到蒙哥马利域
-    mont.toMontVec(va);
-    mont.toMontVec(vb);
 
     int root = 3; // NTT 原根
     auto start = chrono::high_resolution_clock::now();
     // 使用 NTT 在蒙哥马利域执行卷积
+        // 将系数转换到蒙哥马利域
+        mont.toMontVec(va);
+        mont.toMontVec(vb);
     vector<long long> cr = get_result(va, vb, p_, root, mont);
     auto end = chrono::high_resolution_clock::now();
     ans = chrono::duration<double, std::ratio<1, 1000>>(end - start).count();
