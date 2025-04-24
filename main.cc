@@ -156,6 +156,14 @@ vector<int> get_result(vector<int> &a_vec, vector<int> &b_vec, int p, int len, i
     return c_vec;
 }
 
+void poly_multiply(int *a, int *b, int *ab, int n, int p){
+    for(int i = 0; i < n; ++i){
+        for(int j = 0; j < n; ++j){
+            ab[i+j]=(1LL * a[i] * b[j] % p + ab[i+j]) % p;
+        }
+    }
+}
+
 int a[300000], b[300000], ab[300000];
 
 int main(int argc, char *argv[]) {
