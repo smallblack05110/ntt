@@ -81,18 +81,18 @@ public:
     }
     uint64_t N_inv = modinv(N, R);
     N_inv_neg = R - N_inv;
-    __int128 R_squared = static_cast<__int128>(R) * R;
+    __int128_t R_squared = static_cast<__int128_t>(R) * R;
     R2 = static_cast<uint64_t>(R_squared % N);
   }
 
-  // REDC 算法，将 __int128 类型的 T 转换为 Montgomery 域内元素
-  uint64_t REDC(__int128 T) const
+  // REDC 算法，将 __int128_t 类型的 T 转换为 Montgomery 域内元素
+  uint64_t REDC(__int128_t T) const
   {
     uint64_t mask = (logR == 64) ? ~0ULL : ((1ULL << logR) - 1);
     uint64_t m_part = static_cast<uint64_t>(T) & mask;
     uint64_t m = (m_part * N_inv_neg) & mask;
-    __int128 mN = static_cast<__int128>(m) * N;
-    __int128 t_val = (T + mN) >> logR;
+    __int128_t mN = static_cast<__int128_t>(m) * N;
+    __int128_t t_val = (T + mN) >> logR;
     uint64_t t = static_cast<uint64_t>(t_val);
     return t >= N ? t - N : t;
   }
@@ -193,17 +193,18 @@ void fCheck(const uint64_t *ab, int n, int input_id)
   fin.close();
 }
 
-int quick_mod(int a, int b, int p)
+// 改进的quick_mod函数，确保正确处理__int128_t类型
+__int128_t quick_mod(__int128_t a, __int128_t b, __int128_t p)
 { // 快速计算a的b次方
-  int result = 1;
+  __int128_t result = 1;
   a = a % p;
   while (b > 0)
   {
     if (b % 2 == 1)
     {
-      result = (1LL * result * a) % p; // 奇数就多乘一个a
+      result = (result * a) % p; // 奇数就多乘一个a
     }
-    a = (1LL * a * a) % p; // 底数自乘
+    a = (a * a) % p; // 底数自乘
     b /= 2;
   }
   return result;
@@ -303,25 +304,32 @@ vector<uint64_t> get_result(vector<uint64_t> &a, vector<uint64_t> &b, int p, int
   return c;
 }
 
-// CRT的实现
-struct GRes
-{
-  long long g, x, y;
-};
-GRes egcd(long long a, long long b)
-{
-  if (b == 0)
-    return {a, 1, 0};
-  auto r = egcd(b, a % b);
-  return {r.g, r.y, r.x - (a / b) * r.y};
+// 改进的CRT相关函数
+// 扩展欧几里得算法
+void exgcd(__int128_t a, __int128_t b, __int128_t &g, __int128_t &x, __int128_t &y) {
+    if (b == 0) {
+        g = a;
+        x = 1;
+        y = 0;
+        return;
+    }
+    exgcd(b, a % b, g, y, x);
+    y -= (a / b) * x;
 }
-long long modinv_crt(long long a, long long m)
-{ // 找逆元
-  auto r = egcd(a < 0 ? a + m : a, m);
-  if (r.g != 1)
-    throw runtime_error("CRT modinv fail");
-  long long x = r.x % m;
-  return x < 0 ? x + m : x;
+
+// 求逆元
+__int128_t mod_inverse(__int128_t a, __int128_t m) {
+    __int128_t g, x, y;
+    exgcd(a, m, g, x, y);
+    if (g != 1) {
+        throw std::runtime_error("Modular inverse does not exist");
+    }
+    return (x % m + m) % m;  // 确保结果为正数
+}
+
+// 使用费马小定理求逆元(仅适用于m为质数)
+__int128_t mod_inverse_fermat(__int128_t a, __int128_t m) {
+    return quick_mod(a, m - 2, m);
 }
 
 uint64_t a[300000], b[300000], ab[300000];
@@ -336,83 +344,86 @@ int main(int argc, char *argv[])
   int test_begin = 0, test_end = 4;
   const int root = 3;
   const uint64_t R = 1ULL << 31; 
-  const int CRT_CNT = 4;
-    // 查表得到根为3的小模数
-      uint64_t small_mods[CRT_CNT] = {
-        167772161ULL,    // 5*2^25+1
-        469762049ULL,    // 7*2^26+1
-        1224736769ULL,   // 73*2^24+1
-        998244353ULL     // 119*2^23+1
-    };
+  const int CRT_CNT = 3;  // 使用前三个小模数
+      
+  // 查表得到根为3的小模数
+  uint64_t small_mods[CRT_CNT] = {
+      7340033ULL,      // a*2^k+1
+      104857601ULL,    // a*2^k+1
+      469762049ULL     // a*2^k+1
+  };
+
   for (int id = test_begin; id <= test_end; ++id)
   {
     long double ans = 0;
     int n_;
     int64_t p_;
-    __int128 x;
     fRead(a, b, &n_, &p_, id);
-    __int128 M = small_mods[0];
     int len = 1;
     while (len < 2 * n_)
       len <<= 1;
     fill(a + n_, a + len, 0);
     fill(b + n_, b + len, 0);
 
-    // 原来的方法
-    //  MontMul mont(R, p_);
-    //  for (int i = 0; i < len; ++i)
-    //  {
-    //    va[i] = mont.toMont(va[i]);
-    //    vb[i] = mont.toMont(vb[i]);
-    //  }
-
     auto start = chrono::high_resolution_clock::now();
-    // vector<long long> cr = get_result(va, vb, p_, root, mont);
 
-    // 每个小模数下执行NTT
-    vector<vector<uint64_t>> mods(CRT_CNT, vector<uint64_t>(len)); // 储存每个模数下的结果
-    for (int t = 0; t < CRT_CNT; ++t)
-    {
-     int m = small_mods[t];
-    MontMul mont(R, m);
-
-    // 在这里每次都从原始的 a[], b[] 重新拷贝
-    vector<uint64_t> ta(a, a + len), tb(b, b + len);
-
-    // 再把 ta/tb 转到 Montgomery 域
-    for (int i = 0; i < len; ++i) {
-        ta[i] = mont.toMont(ta[i]);
-        tb[i] = mont.toMont(tb[i]);
-    }
-    auto vc = get_result(ta, tb, m, root, mont);
-
-    for (int i = 0; i < len; ++i) 
-        mods[t][i] = mont.fromMont(vc[i]);
-}
-
-    for (int i = 0; i < 2 * n_ - 1; ++i)
-    {
-      x = mods[0][i];
-      __int128 M_cur = small_mods[0];
-      // 依次合并剩余 CRT_CNT-1 个模
-      for (int t = 1; t < CRT_CNT; ++t)
-      {
-        uint64_t mi = small_mods[t];
-        long long ri = (long long)mods[t][i];
-        long long xi_mod_mi = (long long)(x % mi);
-        long long diff = ri - xi_mod_mi;
-        diff %= (long long)mi;
-        if (diff < 0)
-          diff += mi;
-        long long inv = modinv_crt((long long)(M_cur % mi), mi);
-        long long k = (diff * inv) % mi;
-        x += (__int128)k * M_cur;
-        // 更新 M_cur，最后一次迭代无需更新
-        if (t < CRT_CNT - 1)
-          M_cur *= mi;
-      }
-      // 最终对 p_ 取模
-      ab[i] = (uint64_t)(x % p_);
+    if (p_ <= 1LL << 32) {  // 如果模数不大，直接使用单一模数
+        MontMul mont(R, p_);
+        vector<uint64_t> va(a, a + len), vb(b, b + len);
+        
+        for (int i = 0; i < len; ++i) {
+            va[i] = mont.toMont(va[i]);
+            vb[i] = mont.toMont(vb[i]);
+        }
+        
+        auto vc = get_result(va, vb, p_, root, mont);
+        
+        for (int i = 0; i < len; ++i) {
+            ab[i] = mont.fromMont(vc[i]);
+        }
+    } else {  // 对于大模数，使用CRT
+        // 每个小模数下执行NTT
+        vector<vector<uint64_t>> results(CRT_CNT, vector<uint64_t>(len));
+        
+        for (int t = 0; t < CRT_CNT; ++t) {
+            int64_t mod = small_mods[t];
+            MontMul mont(R, mod);
+            vector<uint64_t> va(a, a + len), vb(b, b + len);
+            
+            for (int i = 0; i < len; ++i) {
+                va[i] = mont.toMont(va[i] % mod);
+                vb[i] = mont.toMont(vb[i] % mod);
+            }
+            
+            auto vc = get_result(va, vb, mod, root, mont);
+            
+            for (int i = 0; i < len; ++i) {
+                results[t][i] = mont.fromMont(vc[i]);
+            }
+        }
+        
+        // 计算CRT所需的常量
+        __int128_t M = 1;
+        for (int i = 0; i < CRT_CNT; i++) {
+            M *= small_mods[i];
+        }
+        
+        vector<__int128_t> Mi(CRT_CNT);
+        vector<__int128_t> Mi_inv(CRT_CNT);
+        
+        for (int i = 0; i < CRT_CNT; i++) {
+            Mi[i] = M / small_mods[i];
+            Mi_inv[i] = mod_inverse(Mi[i], small_mods[i]);
+        }
+        
+        // 中国剩余定理合并结果
+        for (int i = 0; i < len; ++i) {
+            __int128_t result = 0;
+            for (int j = 0; j < CRT_CNT; j++) {
+                result = (result + ((__int128_t)results[j][i] * Mi[j] % M) * Mi_inv[j] % M) % M;
+            }
+            ab[i] = result % p_;
+        }
     }
 
     auto end = chrono::high_resolution_clock::now();
