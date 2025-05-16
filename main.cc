@@ -12,6 +12,32 @@
 #include <tuple>
 using namespace std;
 
+std::string uint128_to_string(__uint128_t value)
+{
+  if (value == 0)
+  {
+    return "0";
+  }
+
+  // 缓冲区足够存放最大的128位十进制数（39位）和结束符
+  char buffer[40];
+  int index = 0;
+
+  // 逐位提取数字（反向存储）
+  while (value > 0)
+  {
+    buffer[index++] = '0' + static_cast<char>(value % 10);
+    value /= 10;
+  }
+
+  // 反转数字顺序得到正确字符串
+  std::reverse(buffer, buffer + index);
+
+  // 构造字符串（指定长度避免后续乱码）
+  return std::string(buffer, buffer + index);
+}
+
+
 class MontMul
 {
 private:
@@ -98,19 +124,19 @@ public:
   }
 
   // 将普通整数转换到 Montgomery 域
-  uint64_t toMont(uint64_t a) const
+ __int128_t toMont(__int128_t a) const
   {
     return REDC(a * R2);
   }
 
   // 从 Montgomery 域转换回普通整数
-  uint64_t fromMont(uint64_t aR) const
+  __int128_t fromMont(__int128_t aR) const
   {
     return REDC(aR);
   }
 
   // 在 Montgomery 域内进行乘法运算
-  uint64_t mulMont(uint64_t aR, uint64_t bR) const
+  __int128_t mulMont(__int128_t aR, __int128_t bR) const
   {
     return REDC(aR * bR);
   }
@@ -168,32 +194,28 @@ void fWrite(const uint64_t *ab, int n, int input_id)
   fout.close();
 }
 
-void fCheck(const uint64_t *ab, int n, int input_id)
-{
-  string str1 = "/nttdata/";
-  string str2 = to_string(input_id);
-  string strout = str1 + str2 + ".out";
-  char data_path[strout.size() + 1];
-  copy(strout.begin(), strout.end(), data_path);
-  data_path[strout.size()] = '\0';
-  ifstream fin;
-  fin.open(data_path, ios::in);
-  for (int i = 0; i < n * 2 - 1; ++i)
-  {
-    int x;
-    fin >> x;
-    if (x != ab[i])
-    {
-      cout << "多项式乘法结果错误" << endl;
-      fin.close();
-      return;
+void fCheck(uint64_t *ab, int n, int input_id){
+    // 判断多项式乘法结果是否正确
+    std::string str1 = "/nttdata/";
+    std::string str2 = std::to_string(input_id);
+    std::string strout = str1 + str2 + ".out";
+    char data_path[strout.size() + 1];
+    std::copy(strout.begin(), strout.end(), data_path);
+    data_path[strout.size()] = '\0';
+    std::ifstream fin;
+    fin.open(data_path, std::ios::in);
+    for (int i = 0; i < n * 2 - 1; i++){
+        uint64_t x;
+        fin>>x;
+        if(x != ab[i]){
+            std::cout<<"多项式乘法结果错误"<<std::endl;
+            return;
+        }
     }
-  }
-  cout << "多项式乘法结果正确" << endl;
-  fin.close();
+    std::cout<<"多项式乘法结果正确"<<std::endl;
+    return;
 }
 
-// 改进的quick_mod函数，确保正确处理__int128_t类型
 __int128_t quick_mod(__int128_t a, __int128_t b, __int128_t p)
 { // 快速计算a的b次方
   __int128_t result = 1;
@@ -243,7 +265,7 @@ __int128_t quick_mod(__int128_t a, __int128_t b, __int128_t p)
 //   }
 // }
 
-void ntt_iter(vector<uint64_t> &a, int p, int root, bool invert, const MontMul &mont)
+void ntt_iter(vector<uint64_t> &a, uint64_t p, int root, bool invert, const MontMul &mont)
 {
   int n = a.size();
   for (int i = 1, j = 0; i < n; ++i)
@@ -304,32 +326,23 @@ vector<uint64_t> get_result(vector<uint64_t> &a, vector<uint64_t> &b, int p, int
   return c;
 }
 
-// 改进的CRT相关函数
-// 扩展欧几里得算法
-void exgcd(__int128_t a, __int128_t b, __int128_t &g, __int128_t &x, __int128_t &y) {
-    if (b == 0) {
-        g = a;
-        x = 1;
-        y = 0;
-        return;
-    }
-    exgcd(b, a % b, g, y, x);
-    y -= (a / b) * x;
+__uint128_t power(__uint128_t base, __uint128_t exponent, __uint128_t mod)
+{
+  __uint128_t result = 1;
+  base = base % mod;
+  while (exponent > 0)
+  {
+    if (exponent % 2 == 1)
+      result = (result * base) % mod;
+    exponent >>= 1;
+    base = (base * base) % mod;
+  }
+  return result;
 }
 
-// 求逆元
-__int128_t mod_inverse(__int128_t a, __int128_t m) {
-    __int128_t g, x, y;
-    exgcd(a, m, g, x, y);
-    if (g != 1) {
-        throw std::runtime_error("Modular inverse does not exist");
-    }
-    return (x % m + m) % m;  // 确保结果为正数
-}
-
-// 使用费马小定理求逆元(仅适用于m为质数)
-__int128_t mod_inverse_fermat(__int128_t a, __int128_t m) {
-    return quick_mod(a, m - 2, m);
+__uint128_t modinv_crt(__uint128_t a, __uint128_t m)
+{
+  return power(a, m - 2, m);
 }
 
 uint64_t a[300000], b[300000], ab[300000];
@@ -344,20 +357,33 @@ int main(int argc, char *argv[])
   int test_begin = 0, test_end = 4;
   const int root = 3;
   const uint64_t R = 1ULL << 31; 
-  const int CRT_CNT = 3;  // 使用前三个小模数
-      
-  // 查表得到根为3的小模数
-  uint64_t small_mods[CRT_CNT] = {
-      7340033ULL,      // a*2^k+1
-      104857601ULL,    // a*2^k+1
-      469762049ULL     // a*2^k+1
-  };
+  const int CRT_CNT = 4;
+    // 查表得到根为3的小模数
+    uint64_t small_mods[CRT_CNT] = {
+        469762049, 998244353, 1004535809, 1224736769
+    };
+    
+    // 计算所有模数的乘积
+    __uint128_t M = 1;
+    for (int i = 0; i < CRT_CNT; i++) {
+        M *= small_mods[i];
+    }
+    
+    // 预计算CRT常量
+    __uint128_t K[CRT_CNT];
+    __uint128_t invK[CRT_CNT];
+    for (int i = 0; i < CRT_CNT; i++) {
+        K[i] = M / small_mods[i];
+        // 使用modinv_crt函数计算逆元
+        invK[i] = modinv_crt(K[i], small_mods[i]);
+    }
 
   for (int id = test_begin; id <= test_end; ++id)
   {
     long double ans = 0;
     int n_;
     int64_t p_;
+    __uint128_t x;
     fRead(a, b, &n_, &p_, id);
     int len = 1;
     while (len < 2 * n_)
@@ -365,66 +391,53 @@ int main(int argc, char *argv[])
     fill(a + n_, a + len, 0);
     fill(b + n_, b + len, 0);
 
+
+    
+
     auto start = chrono::high_resolution_clock::now();
 
-    if (p_ <= 1LL << 32) {  // 如果模数不大，直接使用单一模数
-        MontMul mont(R, p_);
-        vector<uint64_t> va(a, a + len), vb(b, b + len);
-        
+    // 每个小模数下执行NTT
+    vector<vector<uint64_t>> mods(CRT_CNT, vector<uint64_t>(len)); // 储存每个模数下的结果
+    for (int t = 0; t < CRT_CNT; ++t)
+    {
+        int64_t m = small_mods[t];
+        MontMul mont(R, m);
+        vector<uint64_t> ta(a, a + len), tb(b, b + len);
+
         for (int i = 0; i < len; ++i) {
-            va[i] = mont.toMont(va[i]);
-            vb[i] = mont.toMont(vb[i]);
+            ta[i] = mont.toMont(ta[i]);
+            tb[i] = mont.toMont(tb[i]);
         }
-        
-        auto vc = get_result(va, vb, p_, root, mont);
-        
-        for (int i = 0; i < len; ++i) {
-            ab[i] = mont.fromMont(vc[i]);
-        }
-    } else {  // 对于大模数，使用CRT
-        // 每个小模数下执行NTT
-        vector<vector<uint64_t>> results(CRT_CNT, vector<uint64_t>(len));
-        
-        for (int t = 0; t < CRT_CNT; ++t) {
-            int64_t mod = small_mods[t];
-            MontMul mont(R, mod);
-            vector<uint64_t> va(a, a + len), vb(b, b + len);
-            
-            for (int i = 0; i < len; ++i) {
-                va[i] = mont.toMont(va[i] % mod);
-                vb[i] = mont.toMont(vb[i] % mod);
-            }
-            
-            auto vc = get_result(va, vb, mod, root, mont);
-            
-            for (int i = 0; i < len; ++i) {
-                results[t][i] = mont.fromMont(vc[i]);
-            }
-        }
-        
-        // 计算CRT所需的常量
-        __int128_t M = 1;
-        for (int i = 0; i < CRT_CNT; i++) {
-            M *= small_mods[i];
-        }
-        
-        vector<__int128_t> Mi(CRT_CNT);
-        vector<__int128_t> Mi_inv(CRT_CNT);
-        
-        for (int i = 0; i < CRT_CNT; i++) {
-            Mi[i] = M / small_mods[i];
-            Mi_inv[i] = mod_inverse(Mi[i], small_mods[i]);
-        }
-        
-        // 中国剩余定理合并结果
-        for (int i = 0; i < len; ++i) {
-            __int128_t result = 0;
-            for (int j = 0; j < CRT_CNT; j++) {
-                result = (result + ((__int128_t)results[j][i] * Mi[j] % M) * Mi_inv[j] % M) % M;
-            }
-            ab[i] = result % p_;
-        }
+        auto vc = get_result(ta, tb, m, root, mont);
+
+        for (int i = 0; i < len; ++i) 
+            mods[t][i] = mont.fromMont(vc[i]);
     }
+    // 在CRT合并前清零
+    fill(ab, ab + len, 0);
+    
+    // 修改后的CRT计算，防止溢出
+    for (int i = 0; i < len; ++i) {
+        __uint128_t result = 0;
+        for (int j = 0; j < CRT_CNT; ++j) {
+            // 计算当前模数系统下的结果并立即取模
+            __uint128_t term = mods[j][i];
+            term = (term * invK[j]) % small_mods[j];
+            // 乘以对应的系数并立即取模，防止溢出
+            term = (term * K[j]) % M;
+            // 累加到最终结果
+            result = (result + term) % M;
+        }
+        ab[i] = result % p_;
+    }
+
+    // 还原到原来的模数
+    for (int i = 0; i < len; ++i)
+
+    {
+      ab[i] = (ab[i] % p_ + p_) % p_;
+    }
+    
 
     auto end = chrono::high_resolution_clock::now();
     ans = chrono::duration<double, ratio<1, 1000>>(end - start).count();
@@ -432,6 +445,8 @@ int main(int argc, char *argv[])
     fCheck(ab, n_, id);
     cout << "average latency for n = " << n_ << " p = " << p_ << " : " << ans << " (us)" << endl;
     fWrite(ab, n_, id);
+
+    
   }
   return 0;
 }
