@@ -10,6 +10,8 @@
 #include <vector>
 #include <algorithm>
 #include <tuple>
+#include <thread>
+#include <pthread.h>
 using namespace std;
 
 std::string uint128_to_string(__uint128_t value)
@@ -141,7 +143,6 @@ public:
     return REDC(aR * bR);
   }
 
-  // 保持原有接口：对于 a, b（要求均小于模 N），返回 a * b mod N
   uint64_t ModMul(uint64_t a, uint64_t b)
   {
     if (a >= N || b >= N)
@@ -264,6 +265,97 @@ __int128_t quick_mod(__int128_t a, __int128_t b, __int128_t p)
 //     w0 = mont.ModMul(w0, wn); // 使用蒙哥马利模乘
 //   }
 // }
+//ThreadData 结构体
+struct ThreadData {
+    vector<uint64_t> *a;
+    uint64_t p;
+    int root;
+    bool invert;
+    const MontMul *mont; 
+    int len;
+    int tid, num_threads;
+};
+
+ //线程函数
+void* ntt_worker(void *arg) {
+    auto *d = static_cast<ThreadData*>(arg);
+    int n = d->a->size();
+
+    long long wn = quick_mod(d->root, (d->p - 1) / d->len, d->p);
+    if (d->invert) 
+        wn = quick_mod(wn, d->p - 2, d->p);
+    long long wnR = d->mont->toMont(wn);  // ← 用箭头
+
+    for (int i = d->tid * d->len; i < n; i += d->num_threads * d->len) {
+        long long w = d->mont->toMont(1);
+        for (int j = 0; j < d->len/2; ++j) {
+            long long u = (*d->a)[i + j];
+            long long v = d->mont->mulMont(w, (*d->a)[i + j + d->len/2]);
+            (*d->a)[i + j]           = (u + v) % d->p;
+            (*d->a)[i + j + d->len/2] = (u - v + d->p) % d->p;
+            w = d->mont->mulMont(w, wnR);
+        }
+    }
+
+    return nullptr;
+}
+
+
+void ntt_iter_parallel(vector<uint64_t> &a, uint64_t p, int root, bool invert,
+                       const MontMul &mont, int num_threads)
+{
+    int n = a.size();
+    // 位反转不变
+    for (int i = 1, j = 0; i < n; ++i) {
+        int bit = n >> 1;
+        for (; j & bit; bit >>= 1) j ^= bit;
+        j |= bit;
+        if (i < j) swap(a[i], a[j]);
+    }
+
+    // 各层并行
+    for (int len = 2; len <= n; len <<= 1) {
+        vector<pthread_t> threads(num_threads);
+        vector<ThreadData>  tdata(num_threads);
+
+        for (int t = 0; t < num_threads; ++t) {
+            tdata[t] = ThreadData{
+                &a,           // a
+                p,            // 模数
+                root,
+                invert,
+                &mont,        
+                len,
+                t,
+                num_threads
+            };
+            pthread_create(&threads[t], nullptr, ntt_worker, &tdata[t]);
+        }
+        for (int t = 0; t < num_threads; ++t)
+            pthread_join(threads[t], nullptr);
+    }
+}
+
+vector<uint64_t> get_result(vector<uint64_t> &a, vector<uint64_t> &b,
+                             int p, int root, const MontMul &mont)
+{
+    unsigned num_threads = thread::hardware_concurrency();  // 或者固定一个值
+
+    ntt_iter_parallel(a, p, root, false, mont, num_threads);
+    ntt_iter_parallel(b, p, root, false, mont, num_threads);
+
+    vector<uint64_t> c(a.size());
+    for (size_t i = 0; i < a.size(); ++i)
+        c[i] = mont.mulMont(a[i], b[i]);
+    ntt_iter_parallel(c, p, root, true, mont, num_threads);
+
+    int inv_n = quick_mod(a.size(), p - 2, p);
+    long long invR = mont.toMont(inv_n);
+    for (size_t i = 0; i < c.size(); ++i)
+        c[i] = mont.mulMont(c[i], invR);
+
+    return c;
+}
 
 void ntt_iter(vector<uint64_t> &a, uint64_t p, int root, bool invert, const MontMul &mont)
 {
@@ -310,21 +402,21 @@ void poly_multiply(int *a, int *b, int *ab, int n, int p)
   }
 }
 
-vector<uint64_t> get_result(vector<uint64_t> &a, vector<uint64_t> &b, int p, int root, const MontMul &mont)
-{
-  int n = a.size();
-  ntt_iter(a, p, root, false, mont);
-  ntt_iter(b, p, root, false, mont);
-  vector<uint64_t> c(n);
-  for (int i = 0; i < n; ++i)
-    c[i] = mont.mulMont(a[i], b[i]);
-  ntt_iter(c, p, root, true, mont);
-  int inv_n = quick_mod(n, p - 2, p);
-  long long invR = mont.toMont(inv_n);
-  for (int i = 0; i < n; ++i)
-    c[i] = mont.mulMont(c[i], invR);
-  return c;
-}
+// vector<uint64_t> get_result(vector<uint64_t> &a, vector<uint64_t> &b, int p, int root, const MontMul &mont)
+// {
+//   int n = a.size();
+//   ntt_iter(a, p, root, false, mont);
+//   ntt_iter(b, p, root, false, mont);
+//   vector<uint64_t> c(n);
+//   for (int i = 0; i < n; ++i)
+//     c[i] = mont.mulMont(a[i], b[i]);
+//   ntt_iter(c, p, root, true, mont);
+//   int inv_n = quick_mod(n, p - 2, p);
+//   long long invR = mont.toMont(inv_n);
+//   for (int i = 0; i < n; ++i)
+//     c[i] = mont.mulMont(c[i], invR);
+//   return c;
+// }
 
 __uint128_t power(__uint128_t base, __uint128_t exponent, __uint128_t mod)
 {
