@@ -22,3 +22,4 @@ Traceback (most recent call last):
   File "/usr/local/lib/python3.9/site-packages/psshlib/cli.py", line 22, in common_parser
     version=version.VERSION)
 AttributeError: module 'version' has no attribute 'VERSION'
+/var/spool/torque/mom_priv/jobs/15964.master_ubss1.SC: line 11: 1849890 Segmentation fault      (core dumped) /home/${USER}/main

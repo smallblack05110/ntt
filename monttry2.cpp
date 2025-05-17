@@ -10,61 +10,125 @@
 #include <vector>
 #include <algorithm>
 #include <tuple>
+#include <thread>
+#include <pthread.h>
 using namespace std;
 
 class MontMul
 {
-public:
-  MontMul(long long R, long long N)
+private:
+  uint64_t N;
+  uint64_t R;
+  int logR;
+  uint64_t N_inv_neg;
+  uint64_t R2;
+
+  struct EgcdResult
   {
-    this->N = N;
-    this->R = R;
-    this->logR = static_cast<int>(log2(R));
-    long long N_inv = modinv(N, R);
-    this->N_inv_neg = R - N_inv;
-    this->R2 = (R * R) % N;
+    int64_t g;
+    int64_t x;
+    int64_t y;
+  };
+
+  static EgcdResult egcd(uint64_t a, uint64_t b)
+  {
+    uint64_t old_r = a, r = b;
+    int64_t old_s = 1, s = 0;
+    int64_t old_t = 0, t = 1;
+    while (r != 0)
+    {
+      uint64_t quotient = old_r / r;
+      uint64_t temp = old_r;
+      old_r = r;
+      r = temp - quotient * r;
+
+      int64_t temp_s = old_s;
+      old_s = s;
+      s = temp_s - static_cast<int64_t>(quotient) * s;
+
+      int64_t temp_t = old_t;
+      old_t = t;
+      t = temp_t - static_cast<int64_t>(quotient) * t;
+    }
+    return {static_cast<int64_t>(old_r), old_s, old_t};
   }
 
-  static std::tuple<long long, long long, long long> egcd(long long a, long long b)
+  static uint64_t modinv(uint64_t a, uint64_t m)
   {
-    if (a == 0)
+    auto result = egcd(a, m);
+    if (result.g != 1)
     {
-      return std::make_tuple(b, 0, 1);
-    }
-    else
-    {
-      std::tuple<long long, long long, long long> result = egcd(b % a, a);
-      long long g = std::get<0>(result);
-      long long x = std::get<1>(result);
-      long long y = std::get<2>(result);
-      return std::make_tuple(g, y - (b / a) * x, x);
-    }
-  }
-
-  static long long modinv(long long a, long long m)
-  {
-    std::tuple<long long, long long, long long> result = egcd(a, m);
-    long long g = std::get<0>(result);
-    long long x = std::get<1>(result);
-    if (g != 1)
       throw std::runtime_error("modular inverse does not exist");
-    return (x % m + m) % m;
+    }
+    int64_t x = result.x % static_cast<int64_t>(m);
+    if (x < 0)
+    {
+      x += m;
+    }
+    return static_cast<uint64_t>(x);
   }
 
-  long long REDC(long long T) const
+public:
+  // 构造函数要求 R 为 2 的幂
+  MontMul(uint64_t R, uint64_t N) : R(R), N(N)
   {
-    long long m = ((T & ((1LL << logR) - 1)) * N_inv_neg) & ((1LL << logR) - 1);
-    long long t = (T + m * N) >> logR;
+    if (R == 0 || (R & (R - 1)) != 0)
+    {
+      throw std::invalid_argument("R must be a power of two");
+    }
+    logR = static_cast<int>(std::log2(R));
+    if ((1ULL << logR) != R)
+    {
+      throw std::invalid_argument("R is not a power of two");
+    }
+    uint64_t N_inv = modinv(N, R);
+    N_inv_neg = R - N_inv;
+    __int128 R_squared = static_cast<__int128>(R) * R;
+    R2 = static_cast<uint64_t>(R_squared % N);
+  }
+
+  // REDC 算法，将 __int128 类型的 T 转换为 Montgomery 域内元素
+  uint64_t REDC(__int128 T) const
+  {
+    uint64_t mask = (logR == 64) ? ~0ULL : ((1ULL << logR) - 1);
+    uint64_t m_part = static_cast<uint64_t>(T) & mask;
+    uint64_t m = (m_part * N_inv_neg) & mask;
+    __int128 mN = static_cast<__int128>(m) * N;
+    __int128 t_val = (T + mN) >> logR;
+    uint64_t t = static_cast<uint64_t>(t_val);
     return t >= N ? t - N : t;
   }
 
-  long long toMont(long long a) const { return REDC(a * R2); }
-  long long fromMont(long long aR) const { return REDC(aR); }
-  long long mulMont(long long aR, long long bR) const { return REDC(aR * bR); }
+  // 将普通整数转换到 Montgomery 域
+  uint64_t toMont(uint64_t a) const
+  {
+    return REDC(a * R2);
+  }
 
-private:
-  long long N, R, N_inv_neg, R2;
-  int logR;
+  // 从 Montgomery 域转换回普通整数
+  uint64_t fromMont(uint64_t aR) const
+  {
+    return REDC(aR);
+  }
+
+  // 在 Montgomery 域内进行乘法运算
+  uint64_t mulMont(uint64_t aR, uint64_t bR) const
+  {
+    return REDC(aR * bR);
+  }
+
+  // 保持原有接口：对于 a, b（要求均小于模 N），返回 a * b mod N
+  uint64_t ModMul(uint64_t a, uint64_t b)
+  {
+    if (a >= N || b >= N)
+    {
+      throw std::invalid_argument("input must be smaller than modulus N");
+    }
+    uint64_t aR = toMont(a);
+    uint64_t bR = toMont(b);
+    uint64_t abR = mulMont(aR, bR);
+    return fromMont(abR);
+  }
 };
 
 void fRead(int *a, int *b, int *n, int *p, int input_id)
@@ -180,61 +244,122 @@ int quick_mod(int a, int b, int p)
 //   }
 // }
 
-void ntt_iter(vector<long long> &a, int p, int root, bool invert, const MontMul &mont)
-{
-  int n = a.size();
-  for (int i = 1, j = 0; i < n; ++i)
-  {
-    int bit = n >> 1;
-    for (; j & bit; bit >>= 1)
-      j ^= bit;
-    j |= bit;
-    if (i < j)
-      swap(a[i], a[j]);
-  }
+// 1) 修改 ThreadData 结构体
+struct ThreadData {
+    vector<long long> *a;
+    int p;
+    int root;
+    bool invert;
+    const MontMul *mont;  // ← 改为指针
+    int len;
+    int tid, num_threads;
+};
 
-  for (int len = 2; len <= n; len <<= 1)
-  {
-    int wn = quick_mod(root, (p - 1) / len, p);
-    if (invert)
-      wn = quick_mod(wn, p - 2, p);
-    long long wnR = mont.toMont(wn);
-    for (int i = 0; i < n; i += len)
-    {
-      long long w = mont.toMont(1);
-      for (int j = 0; j < len / 2; ++j)
-      {
-        long long u = a[i + j];
-        long long v = mont.mulMont(w, a[i + j + len / 2]);
-        a[i + j] = (u + v) % p;
-        a[i + j + len / 2] = (u - v + p) % p;
-        w = mont.mulMont(w, wnR);
-      }
+// 修改线程函数，访问 mont 时用指针
+void* ntt_worker(void *arg) {
+    auto *d = static_cast<ThreadData*>(arg);
+    int n = d->a->size();
+
+    long long wn = quick_mod(d->root, (d->p - 1) / d->len, d->p);
+    if (d->invert) 
+        wn = quick_mod(wn, d->p - 2, d->p);
+    long long wnR = d->mont->toMont(wn);  // ← 用箭头
+
+    for (int i = d->tid * d->len; i < n; i += d->num_threads * d->len) {
+        long long w = d->mont->toMont(1);
+        for (int j = 0; j < d->len/2; ++j) {
+            long long u = (*d->a)[i + j];
+            long long v = d->mont->mulMont(w, (*d->a)[i + j + d->len/2]);
+            (*d->a)[i + j]           = (u + v) % d->p;
+            (*d->a)[i + j + d->len/2] = (u - v + d->p) % d->p;
+            w = d->mont->mulMont(w, wnR);
+        }
     }
-  }
+
+    return nullptr;
 }
 
-vector<long long> get_result(vector<long long> &a, vector<long long> &b, int p, int root, const MontMul &mont)
+//并行NTT 函数
+void ntt_iter_parallel(vector<long long> &a, int p, int root, bool invert,
+                       const MontMul &mont, int num_threads)
 {
-  int n = a.size();
-  ntt_iter(a, p, root, false, mont);
-  ntt_iter(b, p, root, false, mont);
-  vector<long long> c(n);
-  for (int i = 0; i < n; ++i)
-    c[i] = mont.mulMont(a[i], b[i]);
-  ntt_iter(c, p, root, true, mont);
-  int inv_n = quick_mod(n, p - 2, p);
-  long long invR = mont.toMont(inv_n);
-  for (int i = 0; i < n; ++i)
-    c[i] = mont.mulMont(c[i], invR);
-  return c;
+    int n = a.size();
+    // 位反转不变
+    for (int i = 1, j = 0; i < n; ++i) {
+        int bit = n >> 1;
+        for (; j & bit; bit >>= 1) j ^= bit;
+        j |= bit;
+        if (i < j) swap(a[i], a[j]);
+    }
+
+    // 各层并行
+    for (int len = 2; len <= n; len <<= 1) {
+        vector<pthread_t> threads(num_threads);
+        vector<ThreadData>  tdata(num_threads);
+
+        for (int t = 0; t < num_threads; ++t) {
+            tdata[t] = ThreadData{
+                &a,           // a
+                p,            // 模数
+                root,
+                invert,
+                &mont,        // ← 传地址
+                len,
+                t,
+                num_threads
+            };
+            pthread_create(&threads[t], nullptr, ntt_worker, &tdata[t]);
+        }
+        for (int t = 0; t < num_threads; ++t)
+            pthread_join(threads[t], nullptr);
+    }
+}
+
+// 4) 在 get_result 中调用并行版
+vector<long long> get_result(vector<long long> &a, vector<long long> &b,
+                             int p, int root, const MontMul &mont)
+{
+    unsigned num_threads = thread::hardware_concurrency();  // 或者固定一个值
+    // 替换这几行：
+    // ntt_iter(a, p, root, false, mont);
+    // ntt_iter(b, p, root, false, mont);
+    ntt_iter_parallel(a, p, root, false, mont, num_threads);
+    ntt_iter_parallel(b, p, root, false, mont, num_threads);
+
+    vector<long long> c(a.size());
+    for (size_t i = 0; i < a.size(); ++i)
+        c[i] = mont.mulMont(a[i], b[i]);
+
+    // 同上替换反变换
+    // ntt_iter(c, p, root, true, mont);
+    ntt_iter_parallel(c, p, root, true, mont, num_threads);
+
+    int inv_n = quick_mod(a.size(), p - 2, p);
+    long long invR = mont.toMont(inv_n);
+    for (size_t i = 0; i < c.size(); ++i)
+        c[i] = mont.mulMont(c[i], invR);
+
+    return c;
+}
+void poly_multiply(int *a, int *b, int *ab, int n, int p){
+    for(int i = 0; i < n; ++i){
+        for(int j = 0; j < n; ++j){
+            ab[i+j]=(1LL * a[i] * b[j] % p + ab[i+j]) % p;
+        }
+    }
 }
 
 int a[300000], b[300000], ab[300000];
 
 int main(int argc, char *argv[])
 {
-  int test_begin = 0, test_end = 3;
+    // 保证输入的所有模数的原根均为 3, 且模数都能表示为 a \times 4 ^ k + 1 的形式
+    // 输入模数分别为 7340033 104857601 469762049 263882790666241
+    // 第四个模数超过了整型表示范围, 如果实现此模数意义下的多项式乘法需要修改框架
+    // 对第四个模数的输入数据不做必要要求, 如果要自行探索大模数 NTT, 请在完成前三个模数的基础代码及优化后实现大模数 NTT
+    // 输入文件共五个, 第一个输入文件 n = 4, 其余四个文件分别对应四个模数, n = 131072
+    // 在实现快速数论变化前, 后四个测试样例运行时间较久, 推荐调试正确性时只使用输入文件 1
+  int test_begin = 0, test_end = 4;
   for (int id = test_begin; id <= test_end; ++id)
   {
     long double ans = 0;
