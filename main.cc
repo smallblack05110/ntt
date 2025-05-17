@@ -10,35 +10,57 @@
 #include <vector>
 #include <algorithm>
 #include <tuple>
-#include <thread>
-#include <pthread.h>
+#include <pthread.h> // 引入 pthread 头文件
+#include <unistd.h>  // 支持 sysconf 获取 CPU 核心数
+
 using namespace std;
 
+// 提前声明 MontMul 类
+class MontMul;
+
+// NTT 线程数据结构
+struct NTTThreadData
+{
+  vector<uint64_t> *a;
+  vector<uint64_t> *b;
+  vector<uint64_t> *result;
+  uint64_t p;
+  int root;
+  MontMul *mont;
+};
+
+// CRT 重建线程数据结构
+struct CRTThreadData
+{
+  vector<vector<uint64_t>> *mods; // 存放各小模 NTT 结果的二维向量指针
+  uint64_t *ab;                   // 最终结果数组
+  int start_idx;                  // 处理起始下标
+  int end_idx;                    // 处理结束下标（不含）
+  __uint128_t M;                  // 所有小模数乘积
+  __uint128_t *K;                 // CRT 常数 K 数组
+  __uint128_t *invK;              // CRT 常数 invK 数组
+  int64_t p_;                     // 原大模数
+  int CRT_CNT;                    // 小模数量
+  uint64_t *small_mods;           // 小模数数组
+};
+
+// uint128 转字符串（输出用）
 std::string uint128_to_string(__uint128_t value)
 {
   if (value == 0)
   {
     return "0";
   }
-
-  // 缓冲区足够存放最大的128位十进制数（39位）和结束符
   char buffer[40];
   int index = 0;
-
-  // 逐位提取数字（反向存储）
   while (value > 0)
   {
     buffer[index++] = '0' + static_cast<char>(value % 10);
     value /= 10;
   }
-
-  // 反转数字顺序得到正确字符串
   std::reverse(buffer, buffer + index);
-
-  // 构造字符串（指定长度避免后续乱码）
   return std::string(buffer, buffer + index);
 }
-
 
 class MontMul
 {
@@ -217,219 +239,130 @@ void fCheck(uint64_t *ab, int n, int input_id){
     return;
 }
 
+// 快速幂
 __int128_t quick_mod(__int128_t a, __int128_t b, __int128_t p)
-{ // 快速计算a的b次方
-  __int128_t result = 1;
-  a = a % p;
+{
+  __int128_t res = 1; a %= p;
   while (b > 0)
   {
-    if (b % 2 == 1)
-    {
-      result = (result * a) % p; // 奇数就多乘一个a
-    }
-    a = (a * a) % p; // 底数自乘
-    b /= 2;
+    if (b & 1) res = (res * a) % p;
+    a = (a * a) % p; b >>= 1;
   }
-  return result;
+  return res;
 }
 
-// void ntt_recur(vector<int> &a, int p, int root, bool invert, MontMul &mont)
-// { // ntt递归实现
-//   int n = a.size();
-//   if (n == 1) // 等于一时直接返回
-//     return;
-
-//   int half = n / 2;
-//   vector<int> a_e(half), a_o(half);
-//   for (int i = 0; i < half; ++i)
-//   {
-//     a_e[i] = a[2 * i];     // 偶数项
-//     a_o[i] = a[2 * i + 1]; // 奇数项
-//   }
-//   ntt_recur(a_e, p, root, invert, mont);
-//   ntt_recur(a_o, p, root, invert, mont);
-
-//   int wn = quick_mod(root, (p - 1) / n, p);
-//   if (invert)
-//   {
-//     wn = quick_mod(wn, p - 2, p); // 如果是反变换，wn要取模p-2（费马小定理）
-//   }
-
-//   int w0 = 1;
-//   for (int i = 0; i < half; ++i)
-//   {
-//     int op1 = a_e[i];
-//     int op2 = mont.ModMul(w0, a_o[i]); // 使用蒙哥马利模乘
-//     a[i] = (op1 + op2) % p;
-//     a[i + half] = (op1 - op2 + p) % p;
-//     w0 = mont.ModMul(w0, wn); // 使用蒙哥马利模乘
-//   }
-// }
-//ThreadData 结构体
-struct ThreadData {
-    vector<uint64_t> *a;
-    uint64_t p;
-    int root;
-    bool invert;
-    const MontMul *mont; 
-    int len;
-    int tid, num_threads;
-};
-
- //线程函数
-void* ntt_worker(void *arg) {
-    auto *d = static_cast<ThreadData*>(arg);
-    int n = d->a->size();
-
-    long long wn = quick_mod(d->root, (d->p - 1) / d->len, d->p);
-    if (d->invert) 
-        wn = quick_mod(wn, d->p - 2, d->p);
-    long long wnR = d->mont->toMont(wn);  // ← 用箭头
-
-    for (int i = d->tid * d->len; i < n; i += d->num_threads * d->len) {
-        long long w = d->mont->toMont(1);
-        for (int j = 0; j < d->len/2; ++j) {
-            long long u = (*d->a)[i + j];
-            long long v = d->mont->mulMont(w, (*d->a)[i + j + d->len/2]);
-            (*d->a)[i + j]           = (u + v) % d->p;
-            (*d->a)[i + j + d->len/2] = (u - v + d->p) % d->p;
-            w = d->mont->mulMont(w, wnR);
-        }
-    }
-
-    return nullptr;
-}
-
-
-void ntt_iter_parallel(vector<uint64_t> &a, uint64_t p, int root, bool invert,
-                       const MontMul &mont, int num_threads)
-{
-    int n = a.size();
-    // 位反转不变
-    for (int i = 1, j = 0; i < n; ++i) {
-        int bit = n >> 1;
-        for (; j & bit; bit >>= 1) j ^= bit;
-        j |= bit;
-        if (i < j) swap(a[i], a[j]);
-    }
-
-    // 各层并行
-    for (int len = 2; len <= n; len <<= 1) {
-        vector<pthread_t> threads(num_threads);
-        vector<ThreadData>  tdata(num_threads);
-
-        for (int t = 0; t < num_threads; ++t) {
-            tdata[t] = ThreadData{
-                &a,           // a
-                p,            // 模数
-                root,
-                invert,
-                &mont,        
-                len,
-                t,
-                num_threads
-            };
-            pthread_create(&threads[t], nullptr, ntt_worker, &tdata[t]);
-        }
-        for (int t = 0; t < num_threads; ++t)
-            pthread_join(threads[t], nullptr);
-    }
-}
-
-vector<uint64_t> get_result(vector<uint64_t> &a, vector<uint64_t> &b,
-                             int p, int root, const MontMul &mont)
-{
-    unsigned num_threads = thread::hardware_concurrency();  // 或者固定一个值
-
-    ntt_iter_parallel(a, p, root, false, mont, num_threads);
-    ntt_iter_parallel(b, p, root, false, mont, num_threads);
-
-    vector<uint64_t> c(a.size());
-    for (size_t i = 0; i < a.size(); ++i)
-        c[i] = mont.mulMont(a[i], b[i]);
-    ntt_iter_parallel(c, p, root, true, mont, num_threads);
-
-    int inv_n = quick_mod(a.size(), p - 2, p);
-    long long invR = mont.toMont(inv_n);
-    for (size_t i = 0; i < c.size(); ++i)
-        c[i] = mont.mulMont(c[i], invR);
-
-    return c;
-}
-
+// 单线程 NTT
 void ntt_iter(vector<uint64_t> &a, uint64_t p, int root, bool invert, const MontMul &mont)
 {
   int n = a.size();
   for (int i = 1, j = 0; i < n; ++i)
   {
     int bit = n >> 1;
-    for (; j & bit; bit >>= 1)
-      j ^= bit;
+    for (; j & bit; bit >>= 1) j ^= bit;
     j |= bit;
-    if (i < j)
-      swap(a[i], a[j]);
+    if (i < j) swap(a[i], a[j]);
   }
-
   for (int len = 2; len <= n; len <<= 1)
   {
     int wn = quick_mod(root, (p - 1) / len, p);
-    if (invert)
-      wn = quick_mod(wn, p - 2, p);
-    long long wnR = mont.toMont(wn);
+    if (invert) wn = quick_mod(wn, p - 2, p);
+    uint64_t wnR = mont.toMont(wn);
     for (int i = 0; i < n; i += len)
     {
-      long long w = mont.toMont(1);
+      uint64_t w = mont.toMont(1);
       for (int j = 0; j < len / 2; ++j)
       {
-        long long u = a[i + j];
-        long long v = mont.mulMont(w, a[i + j + len / 2]);
-        a[i + j] = (u + v) % p;
-        a[i + j + len / 2] = (u - v + p) % p;
+        uint64_t u = a[i + j];
+        uint64_t v = mont.mulMont(w, a[i + j + len / 2]);
+        a[i + j]         = (u + v) % p;
+        a[i + j + len/2] = (u - v + p) % p;
         w = mont.mulMont(w, wnR);
       }
     }
   }
 }
 
-void poly_multiply(int *a, int *b, int *ab, int n, int p)
+// NTT 线程入口
+void *ntt_thread_func(void *arg)
 {
-  for (int i = 0; i < n; ++i)
+  auto *d = (NTTThreadData *)arg;
+  vector<uint64_t> ta(*d->a), tb(*d->b);
+  // 转 Montgomery 域
+  for (size_t i = 0; i < ta.size(); ++i)
   {
-    for (int j = 0; j < n; ++j)
-    {
-      ab[i + j] = (1LL * a[i] * b[j] % p + ab[i + j]) % p;
-    }
+    ta[i] = d->mont->toMont(ta[i]);
+    tb[i] = d->mont->toMont(tb[i]);
   }
+  // 正、逆 NTT
+  ntt_iter(ta, d->p, d->root, false, *d->mont);
+  ntt_iter(tb, d->p, d->root, false, *d->mont);
+  // 点乘
+  vector<uint64_t> c(ta.size());
+  for (size_t i = 0; i < ta.size(); ++i)
+    c[i] = d->mont->mulMont(ta[i], tb[i]);
+  // 逆变换
+  ntt_iter(c, d->p, d->root, true, *d->mont);
+  // 乘以 n^{-1}
+  uint64_t inv_n = d->mont->toMont(quick_mod(ta.size(), d->p - 2, d->p));
+  for (size_t i = 0; i < c.size(); ++i)
+    c[i] = d->mont->fromMont(d->mont->mulMont(c[i], inv_n));
+  *(d->result) = move(c);
+  return nullptr;
 }
 
-// vector<uint64_t> get_result(vector<uint64_t> &a, vector<uint64_t> &b, int p, int root, const MontMul &mont)
-// {
-//   int n = a.size();
-//   ntt_iter(a, p, root, false, mont);
-//   ntt_iter(b, p, root, false, mont);
-//   vector<uint64_t> c(n);
-//   for (int i = 0; i < n; ++i)
-//     c[i] = mont.mulMont(a[i], b[i]);
-//   ntt_iter(c, p, root, true, mont);
-//   int inv_n = quick_mod(n, p - 2, p);
-//   long long invR = mont.toMont(inv_n);
-//   for (int i = 0; i < n; ++i)
-//     c[i] = mont.mulMont(c[i], invR);
-//   return c;
-// }
-
-__uint128_t power(__uint128_t base, __uint128_t exponent, __uint128_t mod)
+vector<uint64_t> get_result_pthread(  //仅调用朴素pthread后的结果
+    vector<uint64_t> a,
+    vector<uint64_t> b,
+    uint64_t p,
+    int root,
+    MontMul &mont)
 {
-  __uint128_t result = 1;
-  base = base % mod;
-  while (exponent > 0)
+    NTTThreadData data;
+    data.a      = &a;
+    data.b      = &b;
+    data.p      = p;
+    data.root   = root;
+    data.mont   = &mont;
+
+    vector<uint64_t> res(a.size());
+    data.result = &res;
+
+    pthread_t tid;
+    pthread_create(&tid, nullptr, ntt_thread_func, &data);
+    pthread_join(tid, nullptr);
+
+    return res;
+}
+
+// CRT 合并线程入口
+void *crt_thread_func(void *arg)
+{
+  auto *d = (CRTThreadData *)arg;
+  for (int i = d->start_idx; i < d->end_idx; ++i)
   {
-    if (exponent % 2 == 1)
-      result = (result * base) % mod;
-    exponent >>= 1;
-    base = (base * base) % mod;
+    __uint128_t sum = 0;
+    for (int j = 0; j < d->CRT_CNT; ++j)
+    {
+      __uint128_t term = (*d->mods)[j][i];
+      term = (term * d->invK[j]) % d->small_mods[j];
+      term = (term * d->K[j])     % d->M;
+      sum  = (sum  + term)        % d->M;
+    }
+    d->ab[i] = uint64_t(sum % d->p_);
   }
-  return result;
+  return nullptr;
+}
+
+// CRT 模逆
+__uint128_t power(__uint128_t base, __uint128_t exp, __uint128_t mod)
+{
+  __uint128_t res = 1; base %= mod;
+  while (exp > 0)
+  {
+    if (exp & 1) res = (res * base) % mod;
+    base = (base * base) % mod; exp >>= 1;
+  }
+  return res;
 }
 
 __uint128_t modinv_crt(__uint128_t a, __uint128_t m)
@@ -438,107 +371,131 @@ __uint128_t modinv_crt(__uint128_t a, __uint128_t m)
 }
 
 uint64_t a[300000], b[300000], ab[300000];
+
 int main(int argc, char *argv[])
 {
   // 保证输入的所有模数的原根均为 3, 且模数都能表示为 a \times 4 ^ k + 1 的形式
-  // 输入模数分别为 7340033 104857601 469762049 263882790666241
+  // 输入模数分别为 7340033 104857601 469762049 1337006139375617
   // 第四个模数超过了整型表示范围, 如果实现此模数意义下的多项式乘法需要修改框架
   // 对第四个模数的输入数据不做必要要求, 如果要自行探索大模数 NTT, 请在完成前三个模数的基础代码及优化后实现大模数 NTT
   // 输入文件共五个, 第一个输入文件 n = 4, 其余四个文件分别对应四个模数, n = 131072
   // 在实现快速数论变化前, 后四个测试样例运行时间较久, 推荐调试正确性时只使用输入文件 1
+  // 获取可用 CPU 核心数
+  int num_threads = sysconf(_SC_NPROCESSORS_ONLN);
+  cout << "使用线程数: " << num_threads << endl;
+
   int test_begin = 0, test_end = 4;
   const int root = 3;
-  const uint64_t R = 1ULL << 31; 
+  const uint64_t R = 1ULL << 31;
   const int CRT_CNT = 4;
-    // 查表得到根为3的小模数
-    uint64_t small_mods[CRT_CNT] = {
-        469762049, 998244353, 1004535809, 1224736769
-    };
-    
-    // 计算所有模数的乘积
-    __uint128_t M = 1;
-    for (int i = 0; i < CRT_CNT; i++) {
-        M *= small_mods[i];
-    }
-    
-    // 预计算CRT常量
-    __uint128_t K[CRT_CNT];
-    __uint128_t invK[CRT_CNT];
-    for (int i = 0; i < CRT_CNT; i++) {
-        K[i] = M / small_mods[i];
-        // 使用modinv_crt函数计算逆元
-        invK[i] = modinv_crt(K[i], small_mods[i]);
-    }
+
+  // 根为3的小模数列表
+  uint64_t small_mods[CRT_CNT] = {
+      469762049ULL, 998244353ULL,
+      1004535809ULL,1224736769ULL
+  };
+
+  // 计算所有小模数乘积 M
+  __uint128_t M = 1;
+  for (int i = 0; i < CRT_CNT; ++i) M *= small_mods[i];
+
+  // 预计算 CRT 常量 K 和 invK
+  __uint128_t K[CRT_CNT], invK[CRT_CNT];
+  for (int i = 0; i < CRT_CNT; ++i)
+  {
+    K[i] = M / small_mods[i];
+    invK[i] = modinv_crt(K[i], small_mods[i]);
+  }
 
   for (int id = test_begin; id <= test_end; ++id)
   {
     long double ans = 0;
     int n_;
     int64_t p_;
-    __uint128_t x;
     fRead(a, b, &n_, &p_, id);
-    int len = 1;
-    while (len < 2 * n_)
-      len <<= 1;
+    int len = 1; 
+    while (len < 2 * n_) len <<= 1;
     fill(a + n_, a + len, 0);
     fill(b + n_, b + len, 0);
 
-
-    
-
     auto start = chrono::high_resolution_clock::now();
 
-    // 每个小模数下执行NTT
-    vector<vector<uint64_t>> mods(CRT_CNT, vector<uint64_t>(len)); // 储存每个模数下的结果
+    // 存储每个小模NTT结果
+    vector<vector<uint64_t>> mods(CRT_CNT, vector<uint64_t>(len));
+
+    // 创建并启动 NTT 线程
+    pthread_t ntt_threads[CRT_CNT];
+    NTTThreadData ntt_data[CRT_CNT];
+    MontMul* mont_objs[CRT_CNT];
+
+    vector<uint64_t> a_vec(a, a + len), b_vec(b, b + len);
     for (int t = 0; t < CRT_CNT; ++t)
     {
-        int64_t m = small_mods[t];
-        MontMul mont(R, m);
-        vector<uint64_t> ta(a, a + len), tb(b, b + len);
-
-        for (int i = 0; i < len; ++i) {
-            ta[i] = mont.toMont(ta[i]);
-            tb[i] = mont.toMont(tb[i]);
-        }
-        auto vc = get_result(ta, tb, m, root, mont);
-
-        for (int i = 0; i < len; ++i) 
-            mods[t][i] = mont.fromMont(vc[i]);
-    }
-    // 在CRT合并前清零
-    fill(ab, ab + len, 0);
-    
-    // 修改后的CRT计算，防止溢出
-    for (int i = 0; i < len; ++i) {
-        __uint128_t result = 0;
-        for (int j = 0; j < CRT_CNT; ++j) {
-            // 计算当前模数系统下的结果并立即取模
-            __uint128_t term = mods[j][i];
-            term = (term * invK[j]) % small_mods[j];
-            // 乘以对应的系数并立即取模，防止溢出
-            term = (term * K[j]) % M;
-            // 累加到最终结果
-            result = (result + term) % M;
-        }
-        ab[i] = result % p_;
+      mont_objs[t] = new MontMul(R, small_mods[t]);
+      ntt_data[t].a      = &a_vec;
+      ntt_data[t].b      = &b_vec;
+      ntt_data[t].p      = small_mods[t];
+      ntt_data[t].root   = root;
+      ntt_data[t].mont   = mont_objs[t];
+      ntt_data[t].result = &mods[t];
+      pthread_create(&ntt_threads[t], nullptr, ntt_thread_func, &ntt_data[t]);
     }
 
-    // 还原到原来的模数
-    for (int i = 0; i < len; ++i)
-
+    // 等待 NTT 线程完成并清理
+    for (int t = 0; t < CRT_CNT; ++t)
     {
-      ab[i] = (ab[i] % p_ + p_) % p_;
+      pthread_join(ntt_threads[t], nullptr);
+      delete mont_objs[t];
     }
-    
 
-    auto end = chrono::high_resolution_clock::now();
+    // 清零最终输出数组
+    fill(ab, ab + 2 * n_ - 1, 0);
+
+    // 创建并启动 CRT 合并线程
+    int crt_threads_count = min(num_threads, len);
+    pthread_t crt_threads[crt_threads_count];
+    CRTThreadData crt_data[crt_threads_count];
+
+    int base_chunk = len / crt_threads_count;
+    int rem = len % crt_threads_count;
+    int idx = 0;
+    for (int t = 0; t < crt_threads_count; ++t)
+    {
+      int chunk = base_chunk + (t < rem ? 1 : 0);
+      crt_data[t].mods       = &mods;
+      crt_data[t].ab         = ab;
+      crt_data[t].start_idx  = idx;
+      crt_data[t].end_idx    = idx + chunk;
+      crt_data[t].M          = M;
+      crt_data[t].K          = K;
+      crt_data[t].invK       = invK;
+      crt_data[t].p_         = p_;
+      crt_data[t].CRT_CNT    = CRT_CNT;
+      crt_data[t].small_mods = small_mods;
+      pthread_create(&crt_threads[t], nullptr, crt_thread_func, &crt_data[t]);
+      idx += chunk;
+    }
+
+    // 等待 CRT 线程完成
+    for (int t = 0; t < crt_threads_count; ++t)
+      pthread_join(crt_threads[t], nullptr);
+
+    // 最终还原到大模数
+    for (int i = 0; i < 2 * n_ - 1; ++i)
+      ab[i] = (ab[i] % p_ + p_) % p_;
+    // vector<uint64_t> va(a, a+len), vb(b, b+len);
+    // MontMul mont(R, p_);
+    // auto vc = get_result_pthread(va, vb, p_, root, mont);
+    // for (int i = 0; i < 2*n_ - 1; ++i) {
+    //     ab[i] = vc[i];
+    // }
+     auto end = chrono::high_resolution_clock::now();
     ans = chrono::duration<double, ratio<1, 1000>>(end - start).count();
 
     fCheck(ab, n_, id);
     cout << "average latency for n = " << n_ << " p = " << p_ << " : " << ans << " (us)" << endl;
     fWrite(ab, n_, id);
-
-    
   }
+
   return 0;
 }
