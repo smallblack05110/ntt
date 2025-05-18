@@ -37,6 +37,10 @@ struct NTTThreadData
   int root;
 };
 
+struct uint48_t {
+  uint64_t v : 48;
+};
+static_assert(sizeof(uint48_t) == 6, ""); // 视平台而定
 // CRT 重建线程数据结构 - 适应32位 NTT 结果
 struct CRTThreadData
 {
@@ -152,18 +156,18 @@ void ntt_iter(vector<uint32_t> &a, uint64_t p, int root, bool invert)
     
     for (int i = 0; i < n; i += len)
     {
-      uint64_t w = 1;
+      uint48_t w = 1;
       for (int j = 0; j < len / 2; ++j)
       {
-        uint64_t u = a[i + j];
+        uint32_t u = a[i + j];
         uint64_t v = (static_cast<uint64_t>(a[i + j + len / 2]) * w) % p;
         
         // 使用64位计算，然后再转回32位
-        uint64_t sum = (u + v) % p;
+        uint32_t sum = (u + v) % p;
         uint64_t diff = (u >= v) ? (u - v) : (u + p - v);
         diff %= p;  // 确保在模数范围内
         
-        a[i + j] = static_cast<uint32_t>(sum);
+        a[i + j] = sum;
         a[i + j + len/2] = static_cast<uint32_t>(diff);
         
         w = (w * wn) % p;
@@ -241,7 +245,7 @@ void *crt_thread_func(void *arg)
 }
 
 // CRT 模逆
-__uint128_t power(__uint128_t base, __uint128_t exp, __uint128_t mod)
+__uint128_t power(__uint128_t base, __uint32_t exp, __uint32_t mod)
 {
   __uint128_t res = 1; base %= mod;
   while (exp > 0)
@@ -267,13 +271,20 @@ int main(int argc, char *argv[])
   // 对第四个模数的输入数据不做必要要求, 如果要自行探索大模数 NTT, 请在完成前三个模数的基础代码及优化后实现大模数 NTT
   // 输入文件共五个, 第一个输入文件 n = 4, 其余四个文件分别对应四个模数, n = 131072
   // 在实现快速数论变化前, 后四个测试样例运行时间较久, 推荐调试正确性时只使用输入文件 1
+  
   // 获取可用 CPU 核心数
   int num_threads = sysconf(_SC_NPROCESSORS_ONLN);
-  cout << "使用线程数: " << num_threads << endl;
+  
+  // 设置实际使用线程数（可以根据需要调整）
+  int ntt_threads_count = 8; 
+  int crt_threads_count = num_threads;  // CRT合并阶段使用所有可用核心
+  
+  cout << "CPU核心数: " << num_threads << "，使用NTT线程数: " << ntt_threads_count 
+       << "，CRT线程数: " << crt_threads_count << endl;
 
   int test_begin = 0, test_end = 4;
   const int root = 3;
-  const int CRT_CNT = 4;
+  const int CRT_CNT = 4;  // 小模数数量，也是NTT并行计算的线程数
 
   // 根为3的小模数列表
   uint64_t small_mods[CRT_CNT] = {
@@ -313,7 +324,7 @@ int main(int argc, char *argv[])
     }
 
     // 创建并启动 NTT 线程
-    pthread_t ntt_threads[CRT_CNT];
+    pthread_t ntt_threads[CRT_CNT];  // 使用固定数量的NTT线程
     NTTThreadData ntt_data[CRT_CNT];
 
     // 将64位输入转换为32位向量 - 对每个小模数取模
@@ -329,6 +340,7 @@ int main(int argc, char *argv[])
       }
     }
 
+    // 启动NTT计算线程
     for (int t = 0; t < CRT_CNT; ++t)
     {
       ntt_data[t].a      = &a_vecs[t];  // 为每个线程使用对应模数的数据
@@ -339,7 +351,7 @@ int main(int argc, char *argv[])
       pthread_create(&ntt_threads[t], nullptr, ntt_thread_func, &ntt_data[t]);
     }
 
-    // 等待 NTT 线程完成
+    // 等待所有NTT线程完成
     for (int t = 0; t < CRT_CNT; ++t)
     {
       pthread_join(ntt_threads[t], nullptr);
@@ -349,13 +361,17 @@ int main(int argc, char *argv[])
     fill(ab, ab + 2 * n_ - 1, 0);
 
     // 创建并启动 CRT 合并线程
-    int crt_threads_count = min(num_threads, len);
+    // 限制CRT线程数不超过数据长度
+    crt_threads_count = min(crt_threads_count, len);
     pthread_t crt_threads[crt_threads_count];
     CRTThreadData crt_data[crt_threads_count];
 
+    // 计算每个线程处理的数据块大小
     int base_chunk = len / crt_threads_count;
     int rem = len % crt_threads_count;
     int idx = 0;
+    
+    // 启动CRT合并线程
     for (int t = 0; t < crt_threads_count; ++t)
     {
       int chunk = base_chunk + (t < rem ? 1 : 0);
@@ -373,7 +389,7 @@ int main(int argc, char *argv[])
       idx += chunk;
     }
 
-    // 等待 CRT 线程完成
+    // 等待所有CRT线程完成
     for (int t = 0; t < crt_threads_count; ++t)
       pthread_join(crt_threads[t], nullptr);
 
@@ -385,7 +401,7 @@ int main(int argc, char *argv[])
     ans = chr::duration<double, ratio<1, 1000>>(end - start).count();  // 使用命名空间别名
 
     fCheck(ab, n_, id);
-    cout << "average latency for n = " << n_ << " p = " << p_ << " : " << ans << " (us)" << endl;
+    cout << "average latency for n = " << n_ << " p = " << p_ << " : " << ans << " (ms)" << endl;
     fWrite(ab, n_, id);
   }
 
