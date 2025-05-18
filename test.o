@@ -1,14 +1,13 @@
-使用 NTT 线程数: 4
-使用 CRT 线程数: 3
+使用线程数: 8
 多项式乘法结果正确
-average latency for n = 4 p = 7340033 : 0.40436 (us)
+average latency for n = 4 p = 7340033 : 0.717912 (us)
 多项式乘法结果正确
-average latency for n = 131072 p = 7340033 : 128.959 (us)
+average latency for n = 131072 p = 7340033 : 113.473 (us)
 多项式乘法结果正确
-average latency for n = 131072 p = 104857601 : 127.116 (us)
+average latency for n = 131072 p = 104857601 : 115.535 (us)
 多项式乘法结果正确
-average latency for n = 131072 p = 469762049 : 127.08 (us)
+average latency for n = 131072 p = 469762049 : 117.356 (us)
 多项式乘法结果正确
-average latency for n = 131072 p = 1337006139375617 : 127.927 (us)
+average latency for n = 131072 p = 1337006139375617 : 112.965 (us)
 
 Authorized users only. All activities may be monitored and reported.
