@@ -27,40 +27,35 @@ using std::reverse;
 namespace chr = std::chrono;  // 使用命名空间别名避免冲突
 using std::ratio;  // 从std引入ratio
 
-// 添加巴雷特模乘结构体
-struct BarrettReduction {
-    uint64_t mod;
-    uint64_t mu;
-    uint64_t shift;
-
-    // 构造函数，预计算mu和shift
-    BarrettReduction(uint64_t _mod) : mod(_mod) {
-        // 计算适当的位移
-        shift = 64;
-        mu = (static_cast<__uint128_t>(1) << shift) / mod;
-    }
-
-    // 快速计算 a % mod
-    inline uint64_t reduce(uint64_t a) const {
-        if (a < mod) return a;
-        
-        uint64_t q = (static_cast<__uint128_t>(a) * mu) >> shift;
-        uint64_t r = a - q * mod;
-        
-        return r < mod ? r : r - mod;
-    }
-
-    // 计算 (a * b) % mod，优化乘法后取模
-    inline uint64_t mul_mod(uint64_t a, uint64_t b) const {
-        __uint128_t prod = static_cast<__uint128_t>(a) * b;
-        uint64_t q = (static_cast<__uint128_t>(prod) * mu) >> shift;
-        uint64_t r = prod - q * mod;
-        
-        return r < mod ? r : r - mod;
-    }
+// Montgomery乘法优化相关结构和常量
+struct MontgomeryParams {
+    uint32_t mod;     // 原始模数
+    uint32_t r;       // R = 2^32
+    uint32_t mod_inv; // -mod^(-1) mod R
+    uint32_t r2;      // R^2 mod mod
 };
 
-// NTT 线程数据结构 - 修改为32位，添加巴雷特模乘
+// Montgomery乘法 - 计算 (a * b) mod n
+uint32_t mont_mul(uint32_t a, uint32_t b, const MontgomeryParams& params) {
+    uint64_t t = static_cast<uint64_t>(a) * b;
+    uint32_t m = ((uint32_t)t * params.mod_inv) & 0xFFFFFFFF; // 取低32位
+    uint64_t res = (t + static_cast<uint64_t>(m) * params.mod) >> 32;
+    
+    return (res >= params.mod) ? (res - params.mod) : res;
+}
+
+// 转换为Montgomery表示 - 计算 (a * R) mod n
+uint32_t mont_trans(uint32_t a, const MontgomeryParams& params) {
+    return mont_mul(a, params.r2, params);
+}
+
+// 从Montgomery表示转回 - 计算 (a / R) mod n
+uint32_t mont_reduce(uint32_t a, const MontgomeryParams& params) {
+    uint32_t res = mont_mul(a, 1, params);
+    return res;
+}
+
+// NTT 线程数据结构 - 修改为32位并添加Montgomery参数
 struct NTTThreadData
 {
   vector<uint32_t> *a;
@@ -68,7 +63,7 @@ struct NTTThreadData
   vector<uint32_t> *result;
   uint64_t p;
   int root;
-  BarrettReduction *barrett; // 添加巴雷特模乘
+  MontgomeryParams mont; // 添加Montgomery参数
 };
 
 // CRT 重建线程数据结构 - 适应32位 NTT 结果
@@ -84,7 +79,6 @@ struct CRTThreadData
   int64_t p_;                     // 原大模数
   int CRT_CNT;                    // 小模数量
   uint64_t *small_mods;           // 小模数数组
-  vector<BarrettReduction*> *barrett_mods; // 针对每个小模数的巴雷特归约器
 };
 
 // uint128 转字符串（输出用）
@@ -103,6 +97,57 @@ std::string uint128_to_string(__uint128_t value)
   }
   std::reverse(buffer, buffer + index);
   return std::string(buffer, buffer + index);
+}
+
+// 计算最大公约数
+uint64_t gcd(uint64_t a, uint64_t b) {
+    while (b) {
+        uint64_t t = b;
+        b = a % b;
+        a = t;
+    }
+    return a;
+}
+
+// 扩展欧几里得算法求逆元
+int64_t extended_gcd(int64_t a, int64_t b, int64_t &x, int64_t &y) {
+    if (b == 0) {
+        x = 1;
+        y = 0;
+        return a;
+    }
+    int64_t x1, y1;
+    int64_t d = extended_gcd(b, a % b, x1, y1);
+    x = y1;
+    y = x1 - y1 * (a / b);
+    return d;
+}
+
+// 求逆元
+int64_t mod_inverse(int64_t a, int64_t m) {
+    int64_t x, y;
+    extended_gcd(a, m, x, y);
+    return (x % m + m) % m;
+}
+
+// Montgomery乘法预处理 - 改进版
+MontgomeryParams mont_pre(uint64_t mod) {
+    MontgomeryParams params;
+    params.mod = mod;
+    params.r = 0xFFFFFFFF; // R = 2^32 - 1 (用于计算)
+    
+    // 计算 -mod^(-1) mod 2^32
+    int64_t inv = mod_inverse(mod, 0x100000000ULL);
+    params.mod_inv = (-inv) & 0xFFFFFFFF;
+    
+    // 计算 R^2 mod mod
+    uint64_t r2 = 1;
+    for (int i = 0; i < 64; i++) {
+        r2 = (r2 << 1) % mod;
+    }
+    params.r2 = r2;
+    
+    return params;
 }
 
 void fRead(uint64_t *a, uint64_t *b, int *n, int64_t *p, int input_id)
@@ -157,73 +202,19 @@ void fCheck(uint64_t *ab, int n, int input_id){
     return;
 }
 
-// 使用巴雷特模乘的快速幂
-__int128_t quick_mod_barrett(__int128_t a, __int128_t b, __int128_t p, const BarrettReduction &barrett)
-{
-  __int128_t res = 1; a %= p;
-  while (b > 0)
-  {
-    if (b & 1) res = barrett.reduce(res * a);
-    a = barrett.reduce(a * a); b >>= 1;
-  }
-  return res;
-}
-
-// 原始快速幂（保留用于比较）
-__int128_t quick_mod(__int128_t a, __int128_t b, __int128_t p)
-{
-  __int128_t res = 1; a %= p;
-  while (b > 0)
-  {
-    if (b & 1) res = (res * a) % p;
-    a = (a * a) % p; b >>= 1;
-  }
-  return res;
-}
-
-// 使用巴雷特模乘的NTT迭代实现
-void ntt_iter_barrett(vector<uint32_t> &a, uint64_t p, int root, bool invert, BarrettReduction &barrett)
-{
-  int n = a.size();
-  for (int i = 1, j = 0; i < n; ++i)
-  {
-    int bit = n >> 1;
-    for (; j & bit; bit >>= 1) j ^= bit;
-    j |= bit;
-    if (i < j) swap(a[i], a[j]);
-  }
-  
-  for (int len = 2; len <= n; len <<= 1)
-  {
-    uint64_t wn = quick_mod_barrett(root, (p - 1) / len, p, barrett);
-    if (invert) wn = quick_mod_barrett(wn, p - 2, p, barrett);
-    
-    for (int i = 0; i < n; i += len)
-    {
-      uint32_t w = 1;
-      for (int j = 0; j < len / 2; ++j)
-      {
-        uint32_t u = a[i + j];
-        // 使用巴雷特模乘进行点值乘法
-        uint64_t v = barrett.mul_mod(a[i + j + len / 2], w);
-        
-        uint32_t sum = u + v;
-        if (sum >= p) sum -= p;
-        
-        uint64_t diff = u;
-        if (u < v) diff += p;
-        diff -= v;
-        
-        a[i + j] = sum;
-        a[i + j + len/2] = diff;
-        
-        w = barrett.mul_mod(w, wn);
-      }
+// 快速幂
+uint64_t quick_pow_mod(uint64_t a, uint64_t b, uint64_t p) {
+    uint64_t res = 1;
+    a %= p;
+    while (b > 0) {
+        if (b & 1) res = (res * a) % p;
+        a = (a * a) % p;
+        b >>= 1;
     }
-  }
+    return res;
 }
 
-// 原始NTT迭代实现（保留用于比较）
+// 原始版本的NTT迭代实现
 void ntt_iter(vector<uint32_t> &a, uint64_t p, int root, bool invert)
 {
   int n = a.size();
@@ -237,8 +228,8 @@ void ntt_iter(vector<uint32_t> &a, uint64_t p, int root, bool invert)
   
   for (int len = 2; len <= n; len <<= 1)
   {
-    uint64_t wn = quick_mod(root, (p - 1) / len, p);
-    if (invert) wn = quick_mod(wn, p - 2, p);
+    uint64_t wn = quick_pow_mod(root, (p - 1) / len, p);
+    if (invert) wn = quick_pow_mod(wn, p - 2, p);
     
     for (int i = 0; i < n; i += len)
     {
@@ -260,36 +251,60 @@ void ntt_iter(vector<uint32_t> &a, uint64_t p, int root, bool invert)
       }
     }
   }
+  
+  if (invert) {
+    uint64_t inv_n = quick_pow_mod(n, p - 2, p);
+    for (int i = 0; i < n; ++i)
+      a[i] = static_cast<uint32_t>((static_cast<uint64_t>(a[i]) * inv_n) % p);
+  }
 }
 
-// NTT线程入口 - 使用巴雷特模乘优化版本
+// NTT 线程入口 - 不使用Montgomery优化
 void *ntt_thread_func(void *arg)
 {
   auto *d = (NTTThreadData *)arg;
   vector<uint32_t> ta(*d->a), tb(*d->b);
   
-  // 使用巴雷特模乘进行NTT
-  ntt_iter_barrett(ta, d->p, d->root, false, *(d->barrett));
-  ntt_iter_barrett(tb, d->p, d->root, false, *(d->barrett));
+  // 使用原始NTT实现
+  ntt_iter(ta, d->p, d->root, false);
+  ntt_iter(tb, d->p, d->root, false);
   
-  // 点乘，使用巴雷特模乘
+  // 点乘
   vector<uint32_t> c(ta.size());
-  for (size_t i = 0; i < ta.size(); ++i)
-    c[i] = d->barrett->mul_mod(ta[i], tb[i]);
+  for (size_t i = 0; i < ta.size(); ++i) {
+    c[i] = static_cast<uint32_t>((static_cast<uint64_t>(ta[i]) * tb[i]) % d->p);
+  }
   
-  // 逆变换，使用巴雷特模乘
-  ntt_iter_barrett(c, d->p, d->root, true, *(d->barrett));
+  // 逆变换
+  ntt_iter(c, d->p, d->root, true);
   
-  // 乘以 n^{-1}，使用巴雷特模乘
-  uint64_t inv_n = quick_mod_barrett(ta.size(), d->p - 2, d->p, *(d->barrett));
-  for (size_t i = 0; i < c.size(); ++i)
-    c[i] = d->barrett->mul_mod(c[i], inv_n);
-  
-  *(d->result) = move(c);
+  *(d->result) = std::move(c);
   return nullptr;
 }
 
-// CRT 合并线程入口 - 巴雷特模乘优化版
+vector<uint32_t> get_result_pthread(  //仅调用朴素pthread后的结果
+    vector<uint32_t> a,
+    vector<uint32_t> b,
+    uint64_t p,
+    int root)
+{
+    NTTThreadData data;
+    data.a      = &a;
+    data.b      = &b;
+    data.p      = p;
+    data.root   = root;
+
+    vector<uint32_t> res(a.size());
+    data.result = &res;
+
+    pthread_t tid;
+    pthread_create(&tid, nullptr, ntt_thread_func, &data);
+    pthread_join(tid, nullptr);
+
+    return res;
+}
+
+// CRT 合并线程入口 - 适应32位输入
 void *crt_thread_func(void *arg)
 {
   auto *d = (CRTThreadData *)arg;
@@ -299,37 +314,43 @@ void *crt_thread_func(void *arg)
     for (int j = 0; j < d->CRT_CNT; ++j)
     {
       __uint128_t term = (*(d->mods))[j][i];  // 从32位输入获取
-      // 使用巴雷特模乘计算，避免频繁求模
-      term = (*(d->barrett_mods))[j]->mul_mod(term, d->invK[j]);
-      term = (term * d->K[j]) % d->M;
-      sum = (sum + term) % d->M;
+      term = (term * d->invK[j]) % d->small_mods[j];
+      term = (term * d->K[j])     % d->M;
+      sum  = (sum  + term)        % d->M;
     }
     d->ab[i] = uint64_t(sum % d->p_);
   }
   return nullptr;
 }
 
-// CRT 模逆 - 使用巴雷特模乘
-__uint128_t power_barrett(__uint128_t base, __uint32_t exp, __uint32_t mod, BarrettReduction &barrett)
+// CRT 模逆
+__uint128_t power(__uint128_t base, __uint32_t exp, __uint32_t mod)
 {
   __uint128_t res = 1; base %= mod;
   while (exp > 0)
   {
-    if (exp & 1) res = barrett.reduce(res * base);
-    base = barrett.reduce(base * base); exp >>= 1;
+    if (exp & 1) res = (res * base) % mod;
+    base = (base * base) % mod; exp >>= 1;
   }
   return res;
 }
 
-__uint128_t modinv_crt_barrett(__uint128_t a, __uint128_t m, BarrettReduction &barrett)
+__uint128_t modinv_crt(__uint128_t a, __uint128_t m)
 {
-  return power_barrett(a, m - 2, m, barrett);
+  return power(a, m - 2, m);
 }
 
 uint64_t a[300000], b[300000], ab[300000];
 
 int main(int argc, char *argv[])
 {
+  // 保证输入的所有模数的原根均为 3, 且模数都能表示为 a \times 4 ^ k + 1 的形式
+  // 输入模数分别为 7340033 104857601 469762049 1337006139375617
+  // 第四个模数超过了整型表示范围, 如果实现此模数意义下的多项式乘法需要修改框架
+  // 对第四个模数的输入数据不做必要要求, 如果要自行探索大模数 NTT, 请在完成前三个模数的基础代码及优化后实现大模数 NTT
+  // 输入文件共五个, 第一个输入文件 n = 4, 其余四个文件分别对应四个模数, n = 131072
+  // 在实现快速数论变化前, 后四个测试样例运行时间较久, 推荐调试正确性时只使用输入文件 1
+  
   // 获取可用 CPU 核心数
   int num_threads = sysconf(_SC_NPROCESSORS_ONLN);
   
@@ -347,29 +368,19 @@ int main(int argc, char *argv[])
   // 根为3的小模数列表
   uint64_t small_mods[CRT_CNT] = {
       469762049ULL, 998244353ULL,
-      1004535809ULL,1224736769ULL
+      1004535809ULL, 1224736769ULL
   };
-
-  // 为每个小模数创建巴雷特模乘计算器
-  vector<BarrettReduction*> barrett_mods;
-  for (int i = 0; i < CRT_CNT; ++i) {
-    barrett_mods.push_back(new BarrettReduction(small_mods[i]));
-  }
 
   // 计算所有小模数乘积 M
   __uint128_t M = 1;
   for (int i = 0; i < CRT_CNT; ++i) M *= small_mods[i];
-
-  // 为大模数M创建巴雷特计算器（用于CRT）
-  BarrettReduction barrett_M(M);
 
   // 预计算 CRT 常量 K 和 invK
   __uint128_t K[CRT_CNT], invK[CRT_CNT];
   for (int i = 0; i < CRT_CNT; ++i)
   {
     K[i] = M / small_mods[i];
-    // 使用巴雷特模乘优化
-    invK[i] = modinv_crt_barrett(K[i], small_mods[i], *barrett_mods[i]);
+    invK[i] = modinv_crt(K[i], small_mods[i]);
   }
 
   for (int id = test_begin; id <= test_end; ++id)
@@ -403,9 +414,8 @@ int main(int argc, char *argv[])
       a_vecs[t].resize(len);
       b_vecs[t].resize(len);
       for (int i = 0; i < len; i++) {
-        // 使用巴雷特模乘优化取模运算
-        a_vecs[t][i] = static_cast<uint32_t>(barrett_mods[t]->reduce(a[i]));
-        b_vecs[t][i] = static_cast<uint32_t>(barrett_mods[t]->reduce(b[i]));
+        a_vecs[t][i] = static_cast<uint32_t>(a[i] % small_mods[t]);
+        b_vecs[t][i] = static_cast<uint32_t>(b[i] % small_mods[t]);
       }
     }
 
@@ -417,7 +427,6 @@ int main(int argc, char *argv[])
       ntt_data[t].p      = small_mods[t];  // 使用完整的64位模数
       ntt_data[t].root   = root;
       ntt_data[t].result = &mods[t];
-      ntt_data[t].barrett = barrett_mods[t]; // 传递对应的巴雷特模乘计算器
       pthread_create(&ntt_threads[t], nullptr, ntt_thread_func, &ntt_data[t]);
     }
 
@@ -455,7 +464,6 @@ int main(int argc, char *argv[])
       crt_data[t].p_         = p_;
       crt_data[t].CRT_CNT    = CRT_CNT;
       crt_data[t].small_mods = small_mods;
-      crt_data[t].barrett_mods = &barrett_mods; // 传递巴雷特计算器列表
       pthread_create(&crt_threads[t], nullptr, crt_thread_func, &crt_data[t]);
       idx += chunk;
     }
@@ -464,12 +472,9 @@ int main(int argc, char *argv[])
     for (int t = 0; t < crt_threads_count; ++t)
       pthread_join(crt_threads[t], nullptr);
 
-    // 创建针对最终大模数的巴雷特计算器
-    BarrettReduction barrett_final(p_);
-    
-    // 最终还原到大模数，使用巴雷特模乘优化
+    // 最终还原到大模数
     for (int i = 0; i < 2 * n_ - 1; ++i)
-      ab[i] = barrett_final.reduce(ab[i]);
+      ab[i] = (ab[i] % p_ + p_) % p_;
     
     auto end = chr::high_resolution_clock::now();  // 使用命名空间别名
     ans = chr::duration<double, ratio<1, 1000>>(end - start).count();  // 使用命名空间别名
@@ -477,11 +482,6 @@ int main(int argc, char *argv[])
     fCheck(ab, n_, id);
     cout << "average latency for n = " << n_ << " p = " << p_ << " : " << ans << " (ms)" << endl;
     fWrite(ab, n_, id);
-  }
-
-  // 释放动态分配的巴雷特模乘计算器
-  for (auto &b : barrett_mods) {
-    delete b;
   }
 
   return 0;
