@@ -1,13 +1,13 @@
 CPU核心数: 8，使用NTT线程数: 8，CRT线程数: 8
 多项式乘法结果正确
-average latency for n = 4 p = 7340033 : 0.917731 (ms)
+average latency for n = 4 p = 7340033 : 1.00584 (ms)
 多项式乘法结果正确
-average latency for n = 131072 p = 7340033 : 114.477 (ms)
+average latency for n = 131072 p = 7340033 : 103.546 (ms)
 多项式乘法结果正确
-average latency for n = 131072 p = 104857601 : 115.344 (ms)
+average latency for n = 131072 p = 104857601 : 100.846 (ms)
 多项式乘法结果正确
-average latency for n = 131072 p = 469762049 : 112.244 (ms)
+average latency for n = 131072 p = 469762049 : 100.976 (ms)
 多项式乘法结果正确
-average latency for n = 131072 p = 1337006139375617 : 112.579 (ms)
+average latency for n = 131072 p = 1337006139375617 : 102.75 (ms)
 
 Authorized users only. All activities may be monitored and reported.
