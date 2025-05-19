@@ -1,8 +1,8 @@
 #include <cstring>
-#include <string>
+// #include <string>  // 暂时注释掉，可能有命名冲突
 #include <iostream>
 #include <fstream>
-#include <chrono>
+#include <chrono>  // 保留chrono头文件
 #include <iomanip>
 #include <sys/time.h>
 #include <omp.h>
@@ -10,160 +10,108 @@
 #include <vector>
 #include <algorithm>
 #include <tuple>
-#include <pthread.h> // 添加对 pthread 支持的头文件
-using namespace std;
+#include <pthread.h> // 引入 pthread 头文件
+#include <unistd.h>  // 支持 sysconf 获取 CPU 核心数
 
-// MontMul 类的前向声明
-class MontMul;
+// 使用命名空间但避免使用 string
+using std::cout;
+using std::endl;
+using std::ifstream;
+using std::ofstream;
+using std::vector;
+using std::fill;
+using std::min;
+using std::swap;
+using std::reverse;
+// 显式引入 chrono 命名空间
+namespace chr = std::chrono;  // 使用命名空间别名避免冲突
+using std::ratio;  // 从std引入ratio
 
-// 并行计算中使用的线程数
-const int NUM_THREADS = 8;
+// 添加巴雷特模乘结构体
+struct BarrettReduction {
+    uint64_t mod;
+    uint64_t mu;
+    uint64_t shift;
 
-// NTT 并行计算的线程参数结构体
-struct ThreadParams {
-    vector<long long>* a;    // 指向数据向量的指针
-    int start;               // 处理区间起始索引
-    int end;                 // 处理区间结束索引
-    int len;                 // 当前蝶形长度
-    int p;                   // 模数 p
-    long long wn;            // 原根 wn（未使用，可用于扩展）
-    long long wnR;           // Montgomery 域内 wn
-    const MontMul* mont;     // 指向 Montgomery 运算对象的指针
-    
-    // 构造函数用于正确初始化参数
-    ThreadParams() : a(nullptr), start(0), end(0), len(0), p(0), wn(0), wnR(0), mont(nullptr) {}
+    // 构造函数，预计算mu和shift
+    BarrettReduction(uint64_t _mod) : mod(_mod) {
+        // 计算适当的位移
+        shift = 64;
+        mu = (static_cast<__uint128_t>(1) << shift) / mod;
+    }
+
+    // 快速计算 a % mod
+    inline uint64_t reduce(uint64_t a) const {
+        if (a < mod) return a;
+        
+        uint64_t q = (static_cast<__uint128_t>(a) * mu) >> shift;
+        uint64_t r = a - q * mod;
+        
+        return r < mod ? r : r - mod;
+    }
+
+    // 计算 (a * b) % mod，优化乘法后取模
+    inline uint64_t mul_mod(uint64_t a, uint64_t b) const {
+        __uint128_t prod = static_cast<__uint128_t>(a) * b;
+        uint64_t q = (static_cast<__uint128_t>(prod) * mu) >> shift;
+        uint64_t r = prod - q * mod;
+        
+        return r < mod ? r : r - mod;
+    }
 };
 
-class MontMul
+// NTT 线程数据结构 - 修改为32位，添加巴雷特模乘
+struct NTTThreadData
 {
-private:
-  uint64_t N;         // 模数 N
-  uint64_t R;         // Montgomery 基 R（2 的幂）
-  int logR;           // R 的二进制对数
-  uint64_t N_inv_neg; // -N^{-1} mod R
-  uint64_t R2;        // R^2 mod N
-
-  struct EgcdResult
-  {
-    int64_t g;
-    int64_t x;
-    int64_t y;
-  };
-
-  // 扩展欧几里得算法，返回 {g=xgcd(a,b), x, y}
-  static EgcdResult egcd(uint64_t a, uint64_t b)
-  {
-    uint64_t old_r = a, r = b;
-    int64_t old_s = 1, s = 0;
-    int64_t old_t = 0, t = 1;
-    while (r != 0)
-    {
-      uint64_t quotient = old_r / r;
-      uint64_t temp = old_r;
-      old_r = r;
-      r = temp - quotient * r;
-
-      int64_t temp_s = old_s;
-      old_s = s;
-      s = temp_s - static_cast<int64_t>(quotient) * s;
-
-      int64_t temp_t = old_t;
-      old_t = t;
-      t = temp_t - static_cast<int64_t>(quotient) * t;
-    }
-    return {static_cast<int64_t>(old_r), old_s, old_t};
-  }
-
-  // 计算 a 在模 m 下的乘法逆元
-  static uint64_t modinv(uint64_t a, uint64_t m)
-  {
-    auto result = egcd(a, m);
-    if (result.g != 1)
-    {
-      throw std::runtime_error("模逆不存在");
-    }
-    int64_t x = result.x % static_cast<int64_t>(m);
-    if (x < 0)
-    {
-      x += m;
-    }
-    return static_cast<uint64_t>(x);
-  }
-
-public:
-  // 构造函数，要求 R 为 2 的幂
-  MontMul(uint64_t R, uint64_t N) : R(R), N(N)
-  {
-    if (R == 0 || (R & (R - 1)) != 0)
-    {
-      throw std::invalid_argument("R 必须是 2 的幂");
-    }
-    logR = static_cast<int>(std::log2(R));
-    if ((1ULL << logR) != R)
-    {
-      throw std::invalid_argument("R 不是 2 的幂");
-    }
-    uint64_t N_inv = modinv(N, R);
-    N_inv_neg = R - N_inv;
-    __int128 R_squared = static_cast<__int128>(R) * R;
-    R2 = static_cast<uint64_t>(R_squared % N);
-  }
-
-  // REDC 算法：将 __int128 类型的 T 转换到 Montgomery 域内
-  uint64_t REDC(__int128 T) const
-  {
-    uint64_t mask = (logR == 64) ? ~0ULL : ((1ULL << logR) - 1);
-    uint64_t m_part = static_cast<uint64_t>(T) & mask;
-    uint64_t m = (m_part * N_inv_neg) & mask;
-    __int128 mN = static_cast<__int128>(m) * N;
-    __int128 t_val = (T + mN) >> logR;
-    uint64_t t = static_cast<uint64_t>(t_val);
-    return t >= N ? t - N : t;
-  }
-
-  // 将普通整数转换到 Montgomery 域
-  uint64_t toMont(uint64_t a) const
-  {
-    return REDC(a * R2);
-  }
-
-  // 从 Montgomery 域转换回普通整数
-  uint64_t fromMont(uint64_t aR) const
-  {
-    return REDC(aR);
-  }
-
-  // 在 Montgomery 域内进行乘法运算
-  uint64_t mulMont(uint64_t aR, uint64_t bR) const
-  {
-    return REDC(aR * bR);
-  }
-
-  // 保留原有接口：对于 a, b（均小于 N），返回 a * b mod N
-  uint64_t ModMul(uint64_t a, uint64_t b)
-  {
-    if (a >= N || b >= N)
-    {
-      throw std::invalid_argument("输入必须小于模 N");
-    }
-    uint64_t aR = toMont(a);
-    uint64_t bR = toMont(b);
-    uint64_t abR = mulMont(aR, bR);
-    return fromMont(abR);
-  }
+  vector<uint32_t> *a;
+  vector<uint32_t> *b;
+  vector<uint32_t> *result;
+  uint64_t p;
+  int root;
+  BarrettReduction *barrett; // 添加巴雷特模乘
 };
 
-// 从文件读取输入数据：多项式长度 n，模数 p，和多项式系数 a, b
-void fRead(int *a, int *b, int *n, int *p, int input_id)
+// CRT 重建线程数据结构 - 适应32位 NTT 结果
+struct CRTThreadData
 {
-  string str1 = "/nttdata/";
-  string str2 = to_string(input_id);
-  string strin = str1 + str2 + ".in";
-  char data_path[strin.size() + 1];
-  copy(strin.begin(), strin.end(), data_path);
-  data_path[strin.size()] = '\0';
+  vector<vector<uint32_t>> *mods; // 修改为存放各小模 32位NTT 结果的二维向量指针
+  uint64_t *ab;                   // 最终结果数组
+  int start_idx;                  // 处理起始下标
+  int end_idx;                    // 处理结束下标（不含）
+  __uint128_t M;                  // 所有小模数乘积
+  __uint128_t *K;                 // CRT 常数 K 数组
+  __uint128_t *invK;              // CRT 常数 invK 数组
+  int64_t p_;                     // 原大模数
+  int CRT_CNT;                    // 小模数量
+  uint64_t *small_mods;           // 小模数数组
+  vector<BarrettReduction*> *barrett_mods; // 针对每个小模数的巴雷特归约器
+};
+
+// uint128 转字符串（输出用）
+std::string uint128_to_string(__uint128_t value)
+{
+  if (value == 0)
+  {
+    return "0";
+  }
+  char buffer[40];
+  int index = 0;
+  while (value > 0)
+  {
+    buffer[index++] = '0' + static_cast<char>(value % 10);
+    value /= 10;
+  }
+  std::reverse(buffer, buffer + index);
+  return std::string(buffer, buffer + index);
+}
+
+void fRead(uint64_t *a, uint64_t *b, int *n, int64_t *p, int input_id)
+{
+  char path_buffer[256];
+  sprintf(path_buffer, "/nttdata/%d.in", input_id);
+  
   ifstream fin;
-  fin.open(data_path, ios::in);
+  fin.open(path_buffer, std::ios::in);
   fin >> *n >> *p;
   for (int i = 0; i < *n; ++i)
   {
@@ -176,17 +124,13 @@ void fRead(int *a, int *b, int *n, int *p, int input_id)
   fin.close();
 }
 
-// 将结果写入输出文件
-void fWrite(int *ab, int n, int input_id)
+void fWrite(const uint64_t *ab, int n, int input_id)
 {
-  string str1 = "files/";
-  string str2 = to_string(input_id);
-  string strout = str1 + str2 + ".out";
-  char output_path[strout.size() + 1];
-  copy(strout.begin(), strout.end(), output_path);
-  output_path[strout.size()] = '\0';
+  char path_buffer[256];
+  sprintf(path_buffer, "files/%d.out", input_id);
+  
   ofstream fout;
-  fout.open(output_path, ios::out);
+  fout.open(path_buffer, std::ios::out);
   for (int i = 0; i < n * 2 - 1; ++i)
   {
     fout << ab[i] << '\n';
@@ -194,275 +138,351 @@ void fWrite(int *ab, int n, int input_id)
   fout.close();
 }
 
-// 校验输出是否正确
-void fCheck(int *ab, int n, int input_id)
-{
-  string str1 = "/nttdata/";
-  string str2 = to_string(input_id);
-  string strout = str1 + str2 + ".out";
-  char data_path[strout.size() + 1];
-  copy(strout.begin(), strout.end(), data_path);
-  data_path[strout.size()] = '\0';
-  ifstream fin;
-  fin.open(data_path, ios::in);
-  for (int i = 0; i < n * 2 - 1; ++i)
-  {
-    int x;
-    fin >> x;
-    if (x != ab[i])
-    {
-      cout << "多项式乘法结果错误" << endl;
-      fin.close();
-      return;
+void fCheck(uint64_t *ab, int n, int input_id){
+    // 判断多项式乘法结果是否正确
+    char path_buffer[256];
+    sprintf(path_buffer, "/nttdata/%d.out", input_id);
+    
+    std::ifstream fin;
+    fin.open(path_buffer, std::ios::in);
+    for (int i = 0; i < n * 2 - 1; i++){
+        uint64_t x;
+        fin>>x;
+        if(x != ab[i]){
+            std::cout<<"多项式乘法结果错误"<<std::endl;
+            return;
+        }
     }
-  }
-  cout << "多项式乘法结果正确" << endl;
-  fin.close();
+    std::cout<<"多项式乘法结果正确"<<std::endl;
+    return;
 }
 
-// 快速幂：计算 a^b mod p
-int quick_mod(int a, int b, int p)
+// 使用巴雷特模乘的快速幂
+__int128_t quick_mod_barrett(__int128_t a, __int128_t b, __int128_t p, const BarrettReduction &barrett)
 {
-  int result = 1;
-  a = a % p;
+  __int128_t res = 1; a %= p;
   while (b > 0)
   {
-    if (b % 2 == 1)
-    {
-      result = (1LL * result * a) % p; // 若是奇数，乘一次 a
-    }
-    a = (1LL * a * a) % p; // 平方
-    b /= 2;
+    if (b & 1) res = barrett.reduce(res * a);
+    a = barrett.reduce(a * a); b >>= 1;
   }
-  return result;
+  return res;
 }
 
-// 线程执行的 NTT 计算函数
-void* ntt_thread_func(void* arg) {
-    ThreadParams* params = (ThreadParams*)arg;
-    vector<long long>* a = params->a;
-    int start = params->start;
-    int end = params->end;
-    int len = params->len;
-    int p = params->p;
-    long long wnR = params->wnR;
-    const MontMul* mont = params->mont;
-
-    // 蝶形计算区间并行
-    for (int i = start; i < end; i += len) {
-        long long w = mont->toMont(1);
-        for (int j = 0; j < len / 2; ++j) {
-            long long u = (*a)[i + j];
-            long long v = mont->mulMont(w, (*a)[i + j + len / 2]);
-            (*a)[i + j] = (u + v) % p;
-            (*a)[i + j + len / 2] = (u - v + p) % p;
-            w = mont->mulMont(w, wnR);
-        }
-    }
-    
-    return NULL;
-}
-
-// 点乘阶段的线程函数
-void* pointwise_multiply_thread(void* arg) {
-    ThreadParams* params = (ThreadParams*)arg;
-    vector<long long>* a = params->a;
-    const MontMul* mont = params->mont;
-    int start = params->start;
-    int end = params->end;
-    int p = params->p;
-    vector<long long>* b = (vector<long long>*)(params->wn);  // 重用 wn 保存 b 的地址
-    vector<long long>* c = (vector<long long>*)(params->wnR); // 重用 wnR 保存 c 的地址
-    
-    for (int i = start; i < end; ++i) {
-        (*c)[i] = mont->mulMont((*a)[i], (*b)[i]) % p;
-    }
-    
-    return NULL;
-}
-
-// 使用 pthread 并行的 NTT 迭代版
-void ntt_iter_pthread(vector<long long> &a, int p, int root, bool invert, const MontMul &mont)
+// 原始快速幂（保留用于比较）
+__int128_t quick_mod(__int128_t a, __int128_t b, __int128_t p)
 {
-    int n = a.size();
-    
-    // 位逆序调整
-    for (int i = 1, j = 0; i < n; ++i)
-    {
-        int bit = n >> 1;
-        for (; j & bit; bit >>= 1)
-            j ^= bit;
-        j |= bit;
-        if (i < j)
-            swap(a[i], a[j]);
-    }
-
-    pthread_t threads[NUM_THREADS];
-    ThreadParams params[NUM_THREADS];
-
-    // 按长度迭代进行蝶形计算
-    for (int len = 2; len <= n; len <<= 1)
-    {
-        int wn = quick_mod(root, (p - 1) / len, p);
-        if (invert)
-            wn = quick_mod(wn, p - 2, p);
-        long long wnR = mont.toMont(wn);
-
-        int chunk_size = n / NUM_THREADS;
-        if (chunk_size < len) {
-            // 区间小于蝶形长度时顺序执行
-            for (int i = 0; i < n; i += len)
-            {
-                long long w = mont.toMont(1);
-                for (int j = 0; j < len / 2; ++j)
-                {
-                    long long u = a[i + j];
-                    long long v = mont.mulMont(w, a[i + j + len / 2]);
-                    a[i + j] = (u + v) % p;
-                    a[i + j + len / 2] = (u - v + p) % p;
-                    w = mont.mulMont(w, wnR);
-                }
-            }
-        } else {
-            // 否则并行处理
-            for (int t = 0; t < NUM_THREADS; ++t) {
-                int start = t * chunk_size;
-                int end = (t == NUM_THREADS - 1) ? n : (t + 1) * chunk_size;
-                start = (start / len) * len; // 对齐到 len 的倍数
-                
-                params[t].a = &a;
-                params[t].start = start;
-                params[t].end = end;
-                params[t].len = len;
-                params[t].p = p;
-                params[t].wnR = wnR;
-                params[t].mont = &mont;
-                pthread_create(&threads[t], NULL, ntt_thread_func, &params[t]);
-            }
-            
-            // 等待所有线程完成
-            for (int t = 0; t < NUM_THREADS; ++t) {
-                pthread_join(threads[t], NULL);
-            }
-        }
-    }
+  __int128_t res = 1; a %= p;
+  while (b > 0)
+  {
+    if (b & 1) res = (res * a) % p;
+    a = (a * a) % p; b >>= 1;
+  }
+  return res;
 }
 
-// 最原始的朴素多项式乘法
-void poly_multiply(int *a, int *b, int *ab, int n, int p){
-    for(int i = 0; i < n; ++i){
-        for(int j = 0; j < n; ++j){
-            ab[i+j]=(1LL * a[i] * b[j] % p + ab[i+j]) % p;
-        }
-    }
-}
-
-// 使用 pthread 并行的 get_result，实现完整的 NTT 多项式乘法流程
-vector<long long> get_result_pthread(vector<long long> &a, vector<long long> &b, int p, int root, const MontMul &mont)
+// 使用巴雷特模乘的NTT迭代实现
+void ntt_iter_barrett(vector<uint32_t> &a, uint64_t p, int root, bool invert, BarrettReduction &barrett)
 {
-    int n = a.size();
+  int n = a.size();
+  for (int i = 1, j = 0; i < n; ++i)
+  {
+    int bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j |= bit;
+    if (i < j) swap(a[i], a[j]);
+  }
+  
+  for (int len = 2; len <= n; len <<= 1)
+  {
+    uint64_t wn = quick_mod_barrett(root, (p - 1) / len, p, barrett);
+    if (invert) wn = quick_mod_barrett(wn, p - 2, p, barrett);
     
-    // 正向 NTT
-    ntt_iter_pthread(a, p, root, false, mont);
-    ntt_iter_pthread(b, p, root, false, mont);
-    
-    // 并行点乘阶段
-    vector<long long> c(n);
-    pthread_t threads[NUM_THREADS];
-    ThreadParams params[NUM_THREADS];
-    
-    int chunk_size = n / NUM_THREADS;
-    for (int t = 0; t < NUM_THREADS; ++t) {
-        int start = t * chunk_size;
-        int end = (t == NUM_THREADS - 1) ? n : (t + 1) * chunk_size;
+    for (int i = 0; i < n; i += len)
+    {
+      uint32_t w = 1;
+      for (int j = 0; j < len / 2; ++j)
+      {
+        uint32_t u = a[i + j];
+        // 使用巴雷特模乘进行点值乘法
+        uint64_t v = barrett.mul_mod(a[i + j + len / 2], w);
         
-        // 重用 wn 和 wnR 字段传递 b, c 向量地址
-        params[t].a = &a;
-        params[t].start = start;
-        params[t].end = end;
-        params[t].p = p;
-        params[t].wn = (long long)&b;
-        params[t].wnR = (long long)&c;
-        params[t].mont = &mont;
-        pthread_create(&threads[t], NULL, pointwise_multiply_thread, &params[t]);
-    }
-    
-    // 等待所有线程完成
-    for (int t = 0; t < NUM_THREADS; ++t) {
-        pthread_join(threads[t], NULL);
-    }
-    
-    // 逆向 NTT
-    ntt_iter_pthread(c, p, root, true, mont);
-    
-    // 缩放结果
-    int inv_n = quick_mod(n, p - 2, p);
-    long long invR = mont.toMont(inv_n);
-    
-    // 并行缩放
-    for (int t = 0; t < NUM_THREADS; ++t) {
-        int start = t * chunk_size;
-        int end = (t == NUM_THREADS - 1) ? n : (t + 1) * chunk_size;
+        uint32_t sum = u + v;
+        if (sum >= p) sum -= p;
         
-        for (int i = start; i < end; ++i) {
-            c[i] = mont.mulMont(c[i], invR);
-        }
+        uint64_t diff = u;
+        if (u < v) diff += p;
+        diff -= v;
+        
+        a[i + j] = sum;
+        a[i + j + len/2] = diff;
+        
+        w = barrett.mul_mod(w, wn);
+      }
     }
-    
-    return c;
+  }
 }
 
-int a[300000], b[300000], ab[300000];
+// 原始NTT迭代实现（保留用于比较）
+void ntt_iter(vector<uint32_t> &a, uint64_t p, int root, bool invert)
+{
+  int n = a.size();
+  for (int i = 1, j = 0; i < n; ++i)
+  {
+    int bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j |= bit;
+    if (i < j) swap(a[i], a[j]);
+  }
+  
+  for (int len = 2; len <= n; len <<= 1)
+  {
+    uint64_t wn = quick_mod(root, (p - 1) / len, p);
+    if (invert) wn = quick_mod(wn, p - 2, p);
+    
+    for (int i = 0; i < n; i += len)
+    {
+      uint32_t w = 1;
+      for (int j = 0; j < len / 2; ++j)
+      {
+        uint32_t u = a[i + j];
+        uint64_t v = (static_cast<uint64_t>(a[i + j + len / 2]) * w) % p;
+        
+        // 使用64位计算，然后再转回32位
+        uint32_t sum = (u + v) % p;
+        uint64_t diff = (u >= v) ? (u - v) : (u + p - v);
+        diff %= p;  // 确保在模数范围内
+        
+        a[i + j] = sum;
+        a[i + j + len/2] = static_cast<uint32_t>(diff);
+        
+        w = (w * wn) % p;
+      }
+    }
+  }
+}
+
+// NTT线程入口 - 使用巴雷特模乘优化版本
+void *ntt_thread_func(void *arg)
+{
+  auto *d = (NTTThreadData *)arg;
+  vector<uint32_t> ta(*d->a), tb(*d->b);
+  
+  // 使用巴雷特模乘进行NTT
+  ntt_iter_barrett(ta, d->p, d->root, false, *(d->barrett));
+  ntt_iter_barrett(tb, d->p, d->root, false, *(d->barrett));
+  
+  // 点乘，使用巴雷特模乘
+  vector<uint32_t> c(ta.size());
+  for (size_t i = 0; i < ta.size(); ++i)
+    c[i] = d->barrett->mul_mod(ta[i], tb[i]);
+  
+  // 逆变换，使用巴雷特模乘
+  ntt_iter_barrett(c, d->p, d->root, true, *(d->barrett));
+  
+  // 乘以 n^{-1}，使用巴雷特模乘
+  uint64_t inv_n = quick_mod_barrett(ta.size(), d->p - 2, d->p, *(d->barrett));
+  for (size_t i = 0; i < c.size(); ++i)
+    c[i] = d->barrett->mul_mod(c[i], inv_n);
+  
+  *(d->result) = move(c);
+  return nullptr;
+}
+
+// CRT 合并线程入口 - 巴雷特模乘优化版
+void *crt_thread_func(void *arg)
+{
+  auto *d = (CRTThreadData *)arg;
+  for (int i = d->start_idx; i < d->end_idx; ++i)
+  {
+    __uint128_t sum = 0;
+    for (int j = 0; j < d->CRT_CNT; ++j)
+    {
+      __uint128_t term = (*(d->mods))[j][i];  // 从32位输入获取
+      // 使用巴雷特模乘计算，避免频繁求模
+      term = (*(d->barrett_mods))[j]->mul_mod(term, d->invK[j]);
+      term = (term * d->K[j]) % d->M;
+      sum = (sum + term) % d->M;
+    }
+    d->ab[i] = uint64_t(sum % d->p_);
+  }
+  return nullptr;
+}
+
+// CRT 模逆 - 使用巴雷特模乘
+__uint128_t power_barrett(__uint128_t base, __uint32_t exp, __uint32_t mod, BarrettReduction &barrett)
+{
+  __uint128_t res = 1; base %= mod;
+  while (exp > 0)
+  {
+    if (exp & 1) res = barrett.reduce(res * base);
+    base = barrett.reduce(base * base); exp >>= 1;
+  }
+  return res;
+}
+
+__uint128_t modinv_crt_barrett(__uint128_t a, __uint128_t m, BarrettReduction &barrett)
+{
+  return power_barrett(a, m - 2, m, barrett);
+}
+
+uint64_t a[300000], b[300000], ab[300000];
 
 int main(int argc, char *argv[])
 {
-    // 确保输入模数的原根均为 3，且模数可表示为 a * 4^k + 1
-    // 输入模数分别为 7340033, 104857601, 469762049, 263882790666241
-    // 第四个模数超过整型范围，如需支持大模数 NTT，请在前三个基础上自行扩展
-    // 输入文件共五个，第一个样例 n=4，其余四个样例 n=131072
-    // 在调试正确性期间，建议仅使用第一个样例以节约时间
-    int test_begin = 0, test_end = 4;
-    for (int id = test_begin; id <= test_end; ++id)
-    {
-        long double ans = 0;
-        int n_, p_;
-        fRead(a, b, &n_, &p_, id);
+  // 获取可用 CPU 核心数
+  int num_threads = sysconf(_SC_NPROCESSORS_ONLN);
+  
+  // 设置实际使用线程数（可以根据需要调整）
+  int ntt_threads_count = 8; 
+  int crt_threads_count = num_threads;  // CRT合并阶段使用所有可用核心
+  
+  cout << "CPU核心数: " << num_threads << "，使用NTT线程数: " << ntt_threads_count 
+       << "，CRT线程数: " << crt_threads_count << endl;
 
-        // 初始化输出数组为 0
-        memset(ab, 0, sizeof(int) * (2 * n_));
+  int test_begin = 0, test_end = 4;
+  const int root = 3;
+  const int CRT_CNT = 4;  // 小模数数量，也是NTT并行计算的线程数
 
-        int len = 1;
-        while (len < 2 * n_)
-            len <<= 1;
-        fill(a + n_, a + len, 0);
-        fill(b + n_, b + len, 0);
+  // 根为3的小模数列表
+  uint64_t small_mods[CRT_CNT] = {
+      469762049ULL, 998244353ULL,
+      1004535809ULL,1224736769ULL
+  };
 
-        vector<long long> va(a, a + len), vb(b, b + len);
-        long long R = 1LL << 30;
-        MontMul mont(R, p_);
-        for (int i = 0; i < len; ++i)
-        {
-            va[i] = mont.toMont(va[i]);
-            vb[i] = mont.toMont(vb[i]);
-        }
+  // 为每个小模数创建巴雷特模乘计算器
+  vector<BarrettReduction*> barrett_mods;
+  for (int i = 0; i < CRT_CNT; ++i) {
+    barrett_mods.push_back(new BarrettReduction(small_mods[i]));
+  }
 
-        int root = 3;
-        auto start = chrono::high_resolution_clock::now();
-        
-        // 使用 pthread 版本的 NTT 多项式乘法
-        vector<long long> cr = get_result_pthread(va, vb, p_, root, mont);
-        
-        auto end = chrono::high_resolution_clock::now();
-        ans = chrono::duration<double, ratio<1, 1000>>(end - start).count();
+  // 计算所有小模数乘积 M
+  __uint128_t M = 1;
+  for (int i = 0; i < CRT_CNT; ++i) M *= small_mods[i];
 
-        for (int i = 0; i < 2 * n_ - 1; ++i)
-        {
-            ab[i] = (int)mont.fromMont(cr[i]);
-        }
+  // 为大模数M创建巴雷特计算器（用于CRT）
+  BarrettReduction barrett_M(M);
 
-        fCheck(ab, n_, id);
-        cout << "n = " << n_ << " p = " << p_ << " (pthread) 平均耗时(ms): " << ans << endl;
-        fWrite(ab, n_, id);
+  // 预计算 CRT 常量 K 和 invK
+  __uint128_t K[CRT_CNT], invK[CRT_CNT];
+  for (int i = 0; i < CRT_CNT; ++i)
+  {
+    K[i] = M / small_mods[i];
+    // 使用巴雷特模乘优化
+    invK[i] = modinv_crt_barrett(K[i], small_mods[i], *barrett_mods[i]);
+  }
+
+  for (int id = test_begin; id <= test_end; ++id)
+  {
+    long double ans = 0;
+    int n_;
+    int64_t p_;
+    fRead(a, b, &n_, &p_, id);
+    int len = 1; 
+    while (len < 2 * n_) len <<= 1;
+    fill(a + n_, a + len, 0);
+    fill(b + n_, b + len, 0);
+
+    auto start = chr::high_resolution_clock::now();  // 使用命名空间别名
+
+    // 存储每个小模NTT结果 - 修改为32位
+    vector<vector<uint32_t>> mods(CRT_CNT);
+    for (int i = 0; i < CRT_CNT; i++) {
+        mods[i].resize(len);
     }
-    return 0;
+
+    // 创建并启动 NTT 线程
+    pthread_t ntt_threads[CRT_CNT];  // 使用固定数量的NTT线程
+    NTTThreadData ntt_data[CRT_CNT];
+
+    // 将64位输入转换为32位向量 - 对每个小模数取模
+    vector<vector<uint32_t>> a_vecs(CRT_CNT);
+    vector<vector<uint32_t>> b_vecs(CRT_CNT);
+    
+    for (int t = 0; t < CRT_CNT; ++t) {
+      a_vecs[t].resize(len);
+      b_vecs[t].resize(len);
+      for (int i = 0; i < len; i++) {
+        // 使用巴雷特模乘优化取模运算
+        a_vecs[t][i] = static_cast<uint32_t>(barrett_mods[t]->reduce(a[i]));
+        b_vecs[t][i] = static_cast<uint32_t>(barrett_mods[t]->reduce(b[i]));
+      }
+    }
+
+    // 启动NTT计算线程
+    for (int t = 0; t < CRT_CNT; ++t)
+    {
+      ntt_data[t].a      = &a_vecs[t];  // 为每个线程使用对应模数的数据
+      ntt_data[t].b      = &b_vecs[t];
+      ntt_data[t].p      = small_mods[t];  // 使用完整的64位模数
+      ntt_data[t].root   = root;
+      ntt_data[t].result = &mods[t];
+      ntt_data[t].barrett = barrett_mods[t]; // 传递对应的巴雷特模乘计算器
+      pthread_create(&ntt_threads[t], nullptr, ntt_thread_func, &ntt_data[t]);
+    }
+
+    // 等待所有NTT线程完成
+    for (int t = 0; t < CRT_CNT; ++t)
+    {
+      pthread_join(ntt_threads[t], nullptr);
+    }
+
+    // 清零最终输出数组
+    fill(ab, ab + 2 * n_ - 1, 0);
+
+    // 创建并启动 CRT 合并线程
+    // 限制CRT线程数不超过数据长度
+    crt_threads_count = min(crt_threads_count, len);
+    pthread_t crt_threads[crt_threads_count];
+    CRTThreadData crt_data[crt_threads_count];
+
+    // 计算每个线程处理的数据块大小
+    int base_chunk = len / crt_threads_count;
+    int rem = len % crt_threads_count;
+    int idx = 0;
+    
+    // 启动CRT合并线程
+    for (int t = 0; t < crt_threads_count; ++t)
+    {
+      int chunk = base_chunk + (t < rem ? 1 : 0);
+      crt_data[t].mods       = &mods;
+      crt_data[t].ab         = ab;
+      crt_data[t].start_idx  = idx;
+      crt_data[t].end_idx    = idx + chunk;
+      crt_data[t].M          = M;
+      crt_data[t].K          = K;
+      crt_data[t].invK       = invK;
+      crt_data[t].p_         = p_;
+      crt_data[t].CRT_CNT    = CRT_CNT;
+      crt_data[t].small_mods = small_mods;
+      crt_data[t].barrett_mods = &barrett_mods; // 传递巴雷特计算器列表
+      pthread_create(&crt_threads[t], nullptr, crt_thread_func, &crt_data[t]);
+      idx += chunk;
+    }
+
+    // 等待所有CRT线程完成
+    for (int t = 0; t < crt_threads_count; ++t)
+      pthread_join(crt_threads[t], nullptr);
+
+    // 创建针对最终大模数的巴雷特计算器
+    BarrettReduction barrett_final(p_);
+    
+    // 最终还原到大模数，使用巴雷特模乘优化
+    for (int i = 0; i < 2 * n_ - 1; ++i)
+      ab[i] = barrett_final.reduce(ab[i]);
+    
+    auto end = chr::high_resolution_clock::now();  // 使用命名空间别名
+    ans = chr::duration<double, ratio<1, 1000>>(end - start).count();  // 使用命名空间别名
+
+    fCheck(ab, n_, id);
+    cout << "average latency for n = " << n_ << " p = " << p_ << " : " << ans << " (ms)" << endl;
+    fWrite(ab, n_, id);
+  }
+
+  // 释放动态分配的巴雷特模乘计算器
+  for (auto &b : barrett_mods) {
+    delete b;
+  }
+
+  return 0;
 }
