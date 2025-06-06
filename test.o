@@ -1,13 +1,13 @@
-CPU核心数/OpenMP线程数: 8
+MPI 进程数 = 4
 多项式乘法结果正确
-average latency for n = 4 p = 7340033 : 0.628791 (ms)
+测试 id=0，n=4，p=7340033，耗时=2.41562 ms
 多项式乘法结果正确
-average latency for n = 131072 p = 7340033 : 99.73 (ms)
+测试 id=1，n=131072，p=7340033，耗时=136.336 ms
 多项式乘法结果正确
-average latency for n = 131072 p = 104857601 : 98.057 (ms)
+测试 id=2，n=131072，p=104857601，耗时=139.986 ms
 多项式乘法结果正确
-average latency for n = 131072 p = 469762049 : 97.6241 (ms)
+测试 id=3，n=131072，p=469762049，耗时=127.133 ms
 多项式乘法结果正确
-average latency for n = 131072 p = 1337006139375617 : 99.3955 (ms)
+测试 id=4，n=131072，p=1337006139375617，耗时=129.634 ms
 
 Authorized users only. All activities may be monitored and reported.
