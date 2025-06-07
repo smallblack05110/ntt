@@ -5,6 +5,7 @@
 #include <iomanip>
 #include <sys/time.h>
 #include <mpi.h>
+#include <omp.h>  // 添加OpenMP支持
 #include <cmath>
 #include <vector>
 #include <algorithm>
@@ -127,10 +128,12 @@ __int128_t quick_mod_barrett(__int128_t a, __int128_t b, __int128_t p, const Bar
     return res;
 }
 
-// 修复的NTT迭代实现
+// 修复的NTT迭代实现（支持OpenMP并行）
 void ntt_iter_barrett(vector<uint32_t> &a, uint64_t p, int root, bool invert, BarrettReduction &barrett)
 {
     int n = a.size();
+    
+    // 位逆序 - 串行执行，因为有依赖关系
     for (int i = 1, j = 0; i < n; ++i) {
         int bit = n >> 1;
         for (; j & bit; bit >>= 1) j ^= bit;
@@ -138,10 +141,13 @@ void ntt_iter_barrett(vector<uint32_t> &a, uint64_t p, int root, bool invert, Ba
         if (i < j) swap(a[i], a[j]);
     }
     
+    // NTT变换 - 可以并行化内层循环
     for (int len = 2; len <= n; len <<= 1) {
         uint64_t wn = quick_mod_barrett(root, (p - 1) / len, p, barrett);
         if (invert) wn = quick_mod_barrett(wn, p - 2, p, barrett);
         
+        // 并行化处理不同的块
+        #pragma omp parallel for schedule(static)
         for (int i = 0; i < n; i += len) {
             uint32_t w = 1;
             for (int j = 0; j < len / 2; ++j) {
@@ -173,8 +179,9 @@ void mpi_ntt_compute(vector<uint32_t> &a_local, vector<uint32_t> &b_local,
     ntt_iter_barrett(a_local, p, root, false, barrett);
     ntt_iter_barrett(b_local, p, root, false, barrett);
     
-    // 点乘
+    // 点乘 - 可以并行化
     result_local.resize(a_local.size());
+    #pragma omp parallel for
     for (size_t i = 0; i < a_local.size(); ++i) {
         result_local[i] = barrett.mul_mod(a_local[i], b_local[i]);
     }
@@ -182,8 +189,9 @@ void mpi_ntt_compute(vector<uint32_t> &a_local, vector<uint32_t> &b_local,
     // 逆变换
     ntt_iter_barrett(result_local, p, root, true, barrett);
     
-    // 乘以 n^{-1}
+    // 乘以 n^{-1} - 可以并行化
     uint64_t inv_n = quick_mod_barrett(a_local.size(), p - 2, p, barrett);
+    #pragma omp parallel for
     for (size_t i = 0; i < result_local.size(); ++i) {
         result_local[i] = barrett.mul_mod(result_local[i], inv_n);
     }
@@ -205,12 +213,14 @@ __uint128_t modinv_crt_barrett(__uint128_t a, __uint128_t m, BarrettReduction &b
     return power_barrett(a, m - 2, m, barrett);
 }
 
-// 修复的CRT重建函数
+// 修复的CRT重建函数（支持OpenMP并行）
 void mpi_crt_reconstruction(vector<vector<uint32_t>> &mods, uint64_t *ab, 
                            int start_idx, int end_idx, __uint128_t M, 
                            __uint128_t *K, __uint128_t *invK, int64_t p_, 
                            int CRT_CNT, vector<BarrettReduction*> &barrett_mods)
 {
+    // 并行化CRT重建过程
+    #pragma omp parallel for schedule(static)
     for (int i = start_idx; i < end_idx; ++i) {
         __uint128_t sum = 0;
         for (int j = 0; j < CRT_CNT; ++j) {
@@ -227,15 +237,23 @@ uint64_t a[300000], b[300000], ab[300000];
 
 int main(int argc, char *argv[])
 {
-    // 初始化MPI
-    MPI_Init(&argc, &argv);
+    // 初始化MPI，支持多线程
+    int provided;
+    MPI_Init_thread(&argc, &argv, MPI_THREAD_FUNNELED, &provided);
+    
+    if (provided < MPI_THREAD_FUNNELED) {
+        cout << "Warning: MPI does not provide sufficient thread support!" << endl;
+    }
     
     int rank, size;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
     
+    // 设置OpenMP线程数
+    int num_threads = 4;
     if (rank == 0) {
         cout << "MPI进程数: " << size << endl;
+        cout << "每个进程OpenMP线程数: " << num_threads << endl;
     }
 
     int test_begin = 0, test_end = 4;
@@ -299,22 +317,35 @@ int main(int argc, char *argv[])
             mods[i].resize(len);
         }
 
-        // 修复的工作分配：确保每个模数都被计算
+        // 改进的工作分配：同一进程内使用多线程处理多个模数
+        vector<int> local_mods;  // 当前进程需要处理的模数
         for (int t = 0; t < CRT_CNT; ++t) {
-            if (t % size == rank) {  // 简单的轮询分配
-                vector<uint32_t> a_vec(len), b_vec(len);
-                
-                // 转换为对应模数下的32位数据
-                for (int i = 0; i < len; i++) {
-                    a_vec[i] = static_cast<uint32_t>(barrett_mods[t]->reduce(a[i]));
-                    b_vec[i] = static_cast<uint32_t>(barrett_mods[t]->reduce(b[i]));
-                }
-                
-                // 执行NTT计算
-                vector<uint32_t> result_vec;
-                mpi_ntt_compute(a_vec, b_vec, result_vec, small_mods[t], root, *barrett_mods[t]);
-                
-                mods[t] = move(result_vec);
+            if (t % size == rank) {
+                local_mods.push_back(t);
+            }
+        }
+        
+        // 使用OpenMP并行处理当前进程分配到的所有模数
+        #pragma omp parallel for schedule(dynamic)
+        for (size_t idx = 0; idx < local_mods.size(); ++idx) {
+            int t = local_mods[idx];
+            
+            vector<uint32_t> a_vec(len), b_vec(len);
+            
+            // 转换为对应模数下的32位数据
+            for (int i = 0; i < len; i++) {
+                a_vec[i] = static_cast<uint32_t>(barrett_mods[t]->reduce(a[i]));
+                b_vec[i] = static_cast<uint32_t>(barrett_mods[t]->reduce(b[i]));
+            }
+            
+            // 执行NTT计算（内部也会使用OpenMP并行）
+            vector<uint32_t> result_vec;
+            mpi_ntt_compute(a_vec, b_vec, result_vec, small_mods[t], root, *barrett_mods[t]);
+            
+            // 注意：这里需要确保线程安全的赋值
+            #pragma omp critical
+            {
+                mods[t] = std::move(result_vec);
             }
         }
         
@@ -341,7 +372,7 @@ int main(int argc, char *argv[])
         int start_idx = rank * data_per_process + min(rank, extra_data);
         int end_idx = start_idx + data_per_process + (rank < extra_data ? 1 : 0);
         
-        // 执行本地CRT重建
+        // 执行本地CRT重建（内部使用OpenMP并行）
         mpi_crt_reconstruction(mods, ab, start_idx, end_idx, M, K, invK, p_, CRT_CNT, barrett_mods);
         
         // 修复的结果收集
@@ -355,8 +386,9 @@ int main(int argc, char *argv[])
         MPI_Allgatherv(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL, ab, recvcounts.data(), 
                        displs.data(), MPI_UNSIGNED_LONG_LONG, MPI_COMM_WORLD);
         
-        // 最终还原到大模数 - 只处理有效部分
+        // 最终还原到大模数 - 只处理有效部分（并行化）
         BarrettReduction barrett_final(p_);
+        #pragma omp parallel for
         for (int i = 0; i < 2 * n_ - 1; ++i) {
             ab[i] = barrett_final.reduce(ab[i]);
         }
