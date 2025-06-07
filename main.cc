@@ -4,7 +4,7 @@
 #include <chrono>
 #include <iomanip>
 #include <sys/time.h>
-#include <mpi.h>  // 替换 omp.h 和 pthread.h
+#include <mpi.h>
 #include <cmath>
 #include <vector>
 #include <algorithm>
@@ -21,11 +21,10 @@ using std::fill;
 using std::min;
 using std::swap;
 using std::reverse;
-// 显式引入 chrono 命名空间
 namespace chr = std::chrono;
 using std::ratio;
 
-// 添加巴雷特模乘结构体
+// 修复的巴雷特模乘结构体
 struct BarrettReduction {
     uint64_t mod;
     uint64_t mu;
@@ -128,7 +127,7 @@ __int128_t quick_mod_barrett(__int128_t a, __int128_t b, __int128_t p, const Bar
     return res;
 }
 
-// NTT迭代实现 - 使用巴雷特模乘
+// 修复的NTT迭代实现
 void ntt_iter_barrett(vector<uint32_t> &a, uint64_t p, int root, bool invert, BarrettReduction &barrett)
 {
     int n = a.size();
@@ -165,7 +164,7 @@ void ntt_iter_barrett(vector<uint32_t> &a, uint64_t p, int root, bool invert, Ba
     }
 }
 
-// MPI版本的NTT计算函数
+// 修复的MPI NTT计算函数
 void mpi_ntt_compute(vector<uint32_t> &a_local, vector<uint32_t> &b_local, 
                      vector<uint32_t> &result_local, uint64_t p, int root, 
                      BarrettReduction &barrett)
@@ -190,7 +189,7 @@ void mpi_ntt_compute(vector<uint32_t> &a_local, vector<uint32_t> &b_local,
     }
 }
 
-// CRT模逆 - 使用巴雷特模乘
+// CRT模逆
 __uint128_t power_barrett(__uint128_t base, __uint32_t exp, __uint32_t mod, BarrettReduction &barrett)
 {
     __uint128_t res = 1; base %= mod;
@@ -206,7 +205,7 @@ __uint128_t modinv_crt_barrett(__uint128_t a, __uint128_t m, BarrettReduction &b
     return power_barrett(a, m - 2, m, barrett);
 }
 
-// MPI版本的CRT合并函数
+// 修复的CRT重建函数
 void mpi_crt_reconstruction(vector<vector<uint32_t>> &mods, uint64_t *ab, 
                            int start_idx, int end_idx, __uint128_t M, 
                            __uint128_t *K, __uint128_t *invK, int64_t p_, 
@@ -300,32 +299,28 @@ int main(int argc, char *argv[])
             mods[i].resize(len);
         }
 
-        // MPI并行计算：每个进程负责部分小模数的NTT计算
-        int mods_per_process = CRT_CNT / size;
-        int extra_mods = CRT_CNT % size;
-        int start_mod = rank * mods_per_process + min(rank, extra_mods);
-        int end_mod = start_mod + mods_per_process + (rank < extra_mods ? 1 : 0);
-        
-        // 每个进程计算分配给它的小模数的NTT
-        for (int t = start_mod; t < end_mod; ++t) {
-            vector<uint32_t> a_vec(len), b_vec(len);
-            
-            // 转换为对应模数下的32位数据
-            for (int i = 0; i < len; i++) {
-                a_vec[i] = static_cast<uint32_t>(barrett_mods[t]->reduce(a[i]));
-                b_vec[i] = static_cast<uint32_t>(barrett_mods[t]->reduce(b[i]));
+        // 修复的工作分配：确保每个模数都被计算
+        for (int t = 0; t < CRT_CNT; ++t) {
+            if (t % size == rank) {  // 简单的轮询分配
+                vector<uint32_t> a_vec(len), b_vec(len);
+                
+                // 转换为对应模数下的32位数据
+                for (int i = 0; i < len; i++) {
+                    a_vec[i] = static_cast<uint32_t>(barrett_mods[t]->reduce(a[i]));
+                    b_vec[i] = static_cast<uint32_t>(barrett_mods[t]->reduce(b[i]));
+                }
+                
+                // 执行NTT计算
+                vector<uint32_t> result_vec;
+                mpi_ntt_compute(a_vec, b_vec, result_vec, small_mods[t], root, *barrett_mods[t]);
+                
+                mods[t] = move(result_vec);
             }
-            
-            // 执行NTT计算
-            vector<uint32_t> result_vec;
-            mpi_ntt_compute(a_vec, b_vec, result_vec, small_mods[t], root, *barrett_mods[t]);
-            
-            mods[t] = move(result_vec);
         }
         
-        // 收集所有进程的NTT结果
+        // 修复的数据收集：使用阻塞通信确保正确性
         for (int t = 0; t < CRT_CNT; ++t) {
-            int owner_rank = t * size / CRT_CNT;  // 简化的分配策略
+            int owner_rank = t % size;
             
             if (rank == owner_rank) {
                 // 发送数据到其他进程
@@ -340,7 +335,7 @@ int main(int argc, char *argv[])
             }
         }
         
-        // 并行CRT重建 - 每个进程处理部分数据
+        // 修复的CRT重建：正确的数据分片
         int data_per_process = len / size;
         int extra_data = len % size;
         int start_idx = rank * data_per_process + min(rank, extra_data);
@@ -349,7 +344,7 @@ int main(int argc, char *argv[])
         // 执行本地CRT重建
         mpi_crt_reconstruction(mods, ab, start_idx, end_idx, M, K, invK, p_, CRT_CNT, barrett_mods);
         
-        // 收集所有进程的CRT结果
+        // 修复的结果收集
         vector<int> recvcounts(size), displs(size);
         for (int i = 0; i < size; ++i) {
             int local_data = data_per_process + (i < extra_data ? 1 : 0);
@@ -360,27 +355,11 @@ int main(int argc, char *argv[])
         MPI_Allgatherv(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL, ab, recvcounts.data(), 
                        displs.data(), MPI_UNSIGNED_LONG_LONG, MPI_COMM_WORLD);
         
-        // 最终还原到大模数
+        // 最终还原到大模数 - 只处理有效部分
         BarrettReduction barrett_final(p_);
-        int final_data_per_process = (2 * n_ - 1) / size;
-        int final_extra_data = (2 * n_ - 1) % size;
-        int final_start = rank * final_data_per_process + min(rank, final_extra_data);
-        int final_end = final_start + final_data_per_process + (rank < final_extra_data ? 1 : 0);
-        
-        for (int i = final_start; i < final_end; ++i) {
+        for (int i = 0; i < 2 * n_ - 1; ++i) {
             ab[i] = barrett_final.reduce(ab[i]);
         }
-        
-        // 收集最终结果
-        vector<int> final_recvcounts(size), final_displs(size);
-        for (int i = 0; i < size; ++i) {
-            int local_final = final_data_per_process + (i < final_extra_data ? 1 : 0);
-            final_recvcounts[i] = local_final;
-            final_displs[i] = (i == 0) ? 0 : final_displs[i-1] + final_recvcounts[i-1];
-        }
-        
-        MPI_Allgatherv(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL, ab, final_recvcounts.data(), 
-                       final_displs.data(), MPI_UNSIGNED_LONG_LONG, MPI_COMM_WORLD);
         
         auto end = chr::high_resolution_clock::now();
         ans = chr::duration<double, ratio<1, 1000>>(end - start).count();
