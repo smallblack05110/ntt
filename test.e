@@ -1,4 +1,3 @@
-Warning: Permanently added 'master_ubss1' (ED25519) to the list of known hosts.
 
 Authorized users only. All activities may be monitored and reported.
 

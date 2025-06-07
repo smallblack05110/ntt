@@ -4,13 +4,14 @@
 #include <chrono>
 #include <iomanip>
 #include <sys/time.h>
-#include <mpi.h>
+#include <mpi.h>  // 替换 omp.h 和 pthread.h
 #include <cmath>
 #include <vector>
 #include <algorithm>
 #include <tuple>
 #include <unistd.h>
 
+// 使用命名空间但避免使用 string
 using std::cout;
 using std::endl;
 using std::ifstream;
@@ -20,10 +21,11 @@ using std::fill;
 using std::min;
 using std::swap;
 using std::reverse;
+// 显式引入 chrono 命名空间
 namespace chr = std::chrono;
 using std::ratio;
 
-// 巴雷特模乘结构体
+// 添加巴雷特模乘结构体
 struct BarrettReduction {
     uint64_t mod;
     uint64_t mu;
@@ -126,12 +128,10 @@ __int128_t quick_mod_barrett(__int128_t a, __int128_t b, __int128_t p, const Bar
     return res;
 }
 
-// 优化的NTT实现 - 改进内存访问模式和减少模乘操作
-void ntt_iter_barrett_optimized(vector<uint32_t> &a, uint64_t p, int root, bool invert, BarrettReduction &barrett)
+// NTT迭代实现 - 使用巴雷特模乘
+void ntt_iter_barrett(vector<uint32_t> &a, uint64_t p, int root, bool invert, BarrettReduction &barrett)
 {
     int n = a.size();
-    
-    // 位反转置换 - 优化版本
     for (int i = 1, j = 0; i < n; ++i) {
         int bit = n >> 1;
         for (; j & bit; bit >>= 1) j ^= bit;
@@ -139,36 +139,58 @@ void ntt_iter_barrett_optimized(vector<uint32_t> &a, uint64_t p, int root, bool 
         if (i < j) swap(a[i], a[j]);
     }
     
-    // 预计算单位根的幂 - 减少重复计算
-    vector<uint32_t> w_powers(n/2);
-    
     for (int len = 2; len <= n; len <<= 1) {
         uint64_t wn = quick_mod_barrett(root, (p - 1) / len, p, barrett);
         if (invert) wn = quick_mod_barrett(wn, p - 2, p, barrett);
         
-        // 预计算本轮所需的单位根幂次
-        int half_len = len / 2;
-        w_powers[0] = 1;
-        for (int j = 1; j < half_len; ++j) {
-            w_powers[j] = barrett.mul_mod(w_powers[j-1], wn);
-        }
-        
-        // 并行化蝶形运算
-        #pragma omp parallel for if(len >= 1024)
         for (int i = 0; i < n; i += len) {
-            for (int j = 0; j < half_len; ++j) {
+            uint32_t w = 1;
+            for (int j = 0; j < len / 2; ++j) {
                 uint32_t u = a[i + j];
-                uint64_t v = barrett.mul_mod(a[i + j + half_len], w_powers[j]);
+                uint64_t v = barrett.mul_mod(a[i + j + len / 2], w);
                 
-                // 优化加法和减法
-                a[i + j] = (u + v >= p) ? u + v - p : u + v;
-                a[i + j + half_len] = (u >= v) ? u - v : u + p - v;
+                uint32_t sum = u + v;
+                if (sum >= p) sum -= p;
+                
+                uint64_t diff = u;
+                if (u < v) diff += p;
+                diff -= v;
+                
+                a[i + j] = sum;
+                a[i + j + len/2] = diff;
+                
+                w = barrett.mul_mod(w, wn);
             }
         }
     }
 }
 
-// 优化的CRT模逆
+// MPI版本的NTT计算函数
+void mpi_ntt_compute(vector<uint32_t> &a_local, vector<uint32_t> &b_local, 
+                     vector<uint32_t> &result_local, uint64_t p, int root, 
+                     BarrettReduction &barrett)
+{
+    // 对本地数据进行NTT
+    ntt_iter_barrett(a_local, p, root, false, barrett);
+    ntt_iter_barrett(b_local, p, root, false, barrett);
+    
+    // 点乘
+    result_local.resize(a_local.size());
+    for (size_t i = 0; i < a_local.size(); ++i) {
+        result_local[i] = barrett.mul_mod(a_local[i], b_local[i]);
+    }
+    
+    // 逆变换
+    ntt_iter_barrett(result_local, p, root, true, barrett);
+    
+    // 乘以 n^{-1}
+    uint64_t inv_n = quick_mod_barrett(a_local.size(), p - 2, p, barrett);
+    for (size_t i = 0; i < result_local.size(); ++i) {
+        result_local[i] = barrett.mul_mod(result_local[i], inv_n);
+    }
+}
+
+// CRT模逆 - 使用巴雷特模乘
 __uint128_t power_barrett(__uint128_t base, __uint32_t exp, __uint32_t mod, BarrettReduction &barrett)
 {
     __uint128_t res = 1; base %= mod;
@@ -184,34 +206,23 @@ __uint128_t modinv_crt_barrett(__uint128_t a, __uint128_t m, BarrettReduction &b
     return power_barrett(a, m - 2, m, barrett);
 }
 
-// 优化的MPI数据分发和收集
-class MPIDataManager {
-public:
-    int rank, size;
-    vector<int> sendcounts, displs;
-    MPIDataManager(int r, int s) : rank(r), size(s) {}
-    
-    void setup_distribution(int total_size) {
-        sendcounts.resize(size);
-        displs.resize(size);
-        
-        int base_size = total_size / size;
-        int remainder = total_size % size;
-        
-        for (int i = 0; i < size; ++i) {
-            sendcounts[i] = base_size + (i < remainder ? 1 : 0);
-            displs[i] = (i == 0) ? 0 : displs[i-1] + sendcounts[i-1];
+// MPI版本的CRT合并函数
+void mpi_crt_reconstruction(vector<vector<uint32_t>> &mods, uint64_t *ab, 
+                           int start_idx, int end_idx, __uint128_t M, 
+                           __uint128_t *K, __uint128_t *invK, int64_t p_, 
+                           int CRT_CNT, vector<BarrettReduction*> &barrett_mods)
+{
+    for (int i = start_idx; i < end_idx; ++i) {
+        __uint128_t sum = 0;
+        for (int j = 0; j < CRT_CNT; ++j) {
+            __uint128_t term = mods[j][i];
+            term = barrett_mods[j]->mul_mod(term, invK[j]);
+            term = (term * K[j]) % M;
+            sum = (sum + term) % M;
         }
+        ab[i] = uint64_t(sum % p_);
     }
-    
-    void allgatherv_data(void* data, MPI_Datatype datatype) {
-        MPI_Allgatherv(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL, data, 
-                       sendcounts.data(), displs.data(), datatype, MPI_COMM_WORLD);
-    }
-    
-    int get_local_start() const { return displs[rank]; }
-    int get_local_size() const { return sendcounts[rank]; }
-};
+}
 
 uint64_t a[300000], b[300000], ab[300000];
 
@@ -230,7 +241,7 @@ int main(int argc, char *argv[])
 
     int test_begin = 0, test_end = 4;
     const int root = 3;
-    const int CRT_CNT = 4;
+    const int CRT_CNT = 4;  // 小模数数量
 
     // 根为3的小模数列表
     uint64_t small_mods[CRT_CNT] = {
@@ -254,9 +265,6 @@ int main(int argc, char *argv[])
         K[i] = M / small_mods[i];
         invK[i] = modinv_crt_barrett(K[i], small_mods[i], *barrett_mods[i]);
     }
-
-    // 创建MPI数据管理器
-    MPIDataManager data_manager(rank, size);
 
     for (int id = test_begin; id <= test_end; ++id) {
         long double ans = 0;
@@ -286,62 +294,93 @@ int main(int argc, char *argv[])
         
         auto start = chr::high_resolution_clock::now();
 
-        // 优化1: 减少通信 - 每个进程计算完整的CRT，而不是分发小模数
-        // 每个进程计算所有小模数的NTT，但只处理部分数据点
-        data_manager.setup_distribution(len);
-        int local_start = data_manager.get_local_start();
-        int local_size = data_manager.get_local_size();
+        // 存储每个小模NTT结果
+        vector<vector<uint32_t>> mods(CRT_CNT);
+        for (int i = 0; i < CRT_CNT; i++) {
+            mods[i].resize(len);
+        }
+
+        // MPI并行计算：每个进程负责部分小模数的NTT计算
+        int mods_per_process = CRT_CNT / size;
+        int extra_mods = CRT_CNT % size;
+        int start_mod = rank * mods_per_process + min(rank, extra_mods);
+        int end_mod = start_mod + mods_per_process + (rank < extra_mods ? 1 : 0);
         
-        vector<uint64_t> local_results(local_size);
-        
-        // 每个进程处理自己的数据段
-        for (int i = 0; i < local_size; ++i) {
-            int global_idx = local_start + i;
-            __uint128_t sum = 0;
+        // 每个进程计算分配给它的小模数的NTT
+        for (int t = start_mod; t < end_mod; ++t) {
+            vector<uint32_t> a_vec(len), b_vec(len);
             
-            // 对每个小模数进行NTT计算
-            for (int t = 0; t < CRT_CNT; ++t) {
-                vector<uint32_t> a_vec(len), b_vec(len);
-                
-                // 转换为对应模数下的32位数据
-                for (int j = 0; j < len; j++) {
-                    a_vec[j] = static_cast<uint32_t>(barrett_mods[t]->reduce(a[j]));
-                    b_vec[j] = static_cast<uint32_t>(barrett_mods[t]->reduce(b[j]));
-                }
-                
-                // 执行优化的NTT
-                ntt_iter_barrett_optimized(a_vec, small_mods[t], root, false, *barrett_mods[t]);
-                ntt_iter_barrett_optimized(b_vec, small_mods[t], root, false, *barrett_mods[t]);
-                
-                // 点乘
-                for (int j = 0; j < len; ++j) {
-                    a_vec[j] = barrett_mods[t]->mul_mod(a_vec[j], b_vec[j]);
-                }
-                
-                // 逆NTT
-                ntt_iter_barrett_optimized(a_vec, small_mods[t], root, true, *barrett_mods[t]);
-                
-                // 乘以 n^{-1}
-                uint64_t inv_n = quick_mod_barrett(len, small_mods[t] - 2, small_mods[t], *barrett_mods[t]);
-                for (int j = 0; j < len; ++j) {
-                    a_vec[j] = barrett_mods[t]->mul_mod(a_vec[j], inv_n);
-                }
-                
-                // CRT重建 - 只计算当前进程负责的点
-                __uint128_t term = a_vec[global_idx];
-                term = barrett_mods[t]->mul_mod(term, invK[t]);
-                term = (term * K[t]) % M;
-                sum = (sum + term) % M;
+            // 转换为对应模数下的32位数据
+            for (int i = 0; i < len; i++) {
+                a_vec[i] = static_cast<uint32_t>(barrett_mods[t]->reduce(a[i]));
+                b_vec[i] = static_cast<uint32_t>(barrett_mods[t]->reduce(b[i]));
             }
             
-            local_results[i] = uint64_t(sum % p_);
+            // 执行NTT计算
+            vector<uint32_t> result_vec;
+            mpi_ntt_compute(a_vec, b_vec, result_vec, small_mods[t], root, *barrett_mods[t]);
+            
+            mods[t] = move(result_vec);
         }
         
-        // 收集所有进程的结果
-        fill(ab, ab + len, 0);
-        MPI_Allgatherv(local_results.data(), local_size, MPI_UNSIGNED_LONG_LONG,
-                       ab, data_manager.sendcounts.data(), data_manager.displs.data(),
-                       MPI_UNSIGNED_LONG_LONG, MPI_COMM_WORLD);
+        // 收集所有进程的NTT结果
+        for (int t = 0; t < CRT_CNT; ++t) {
+            int owner_rank = t * size / CRT_CNT;  // 简化的分配策略
+            
+            if (rank == owner_rank) {
+                // 发送数据到其他进程
+                for (int dest = 0; dest < size; ++dest) {
+                    if (dest != rank) {
+                        MPI_Send(mods[t].data(), len, MPI_UNSIGNED, dest, t, MPI_COMM_WORLD);
+                    }
+                }
+            } else {
+                // 接收数据
+                MPI_Recv(mods[t].data(), len, MPI_UNSIGNED, owner_rank, t, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            }
+        }
+        
+        // 并行CRT重建 - 每个进程处理部分数据
+        int data_per_process = len / size;
+        int extra_data = len % size;
+        int start_idx = rank * data_per_process + min(rank, extra_data);
+        int end_idx = start_idx + data_per_process + (rank < extra_data ? 1 : 0);
+        
+        // 执行本地CRT重建
+        mpi_crt_reconstruction(mods, ab, start_idx, end_idx, M, K, invK, p_, CRT_CNT, barrett_mods);
+        
+        // 收集所有进程的CRT结果
+        vector<int> recvcounts(size), displs(size);
+        for (int i = 0; i < size; ++i) {
+            int local_data = data_per_process + (i < extra_data ? 1 : 0);
+            recvcounts[i] = local_data;
+            displs[i] = (i == 0) ? 0 : displs[i-1] + recvcounts[i-1];
+        }
+        
+        MPI_Allgatherv(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL, ab, recvcounts.data(), 
+                       displs.data(), MPI_UNSIGNED_LONG_LONG, MPI_COMM_WORLD);
+        
+        // 最终还原到大模数
+        BarrettReduction barrett_final(p_);
+        int final_data_per_process = (2 * n_ - 1) / size;
+        int final_extra_data = (2 * n_ - 1) % size;
+        int final_start = rank * final_data_per_process + min(rank, final_extra_data);
+        int final_end = final_start + final_data_per_process + (rank < final_extra_data ? 1 : 0);
+        
+        for (int i = final_start; i < final_end; ++i) {
+            ab[i] = barrett_final.reduce(ab[i]);
+        }
+        
+        // 收集最终结果
+        vector<int> final_recvcounts(size), final_displs(size);
+        for (int i = 0; i < size; ++i) {
+            int local_final = final_data_per_process + (i < final_extra_data ? 1 : 0);
+            final_recvcounts[i] = local_final;
+            final_displs[i] = (i == 0) ? 0 : final_displs[i-1] + final_recvcounts[i-1];
+        }
+        
+        MPI_Allgatherv(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL, ab, final_recvcounts.data(), 
+                       final_displs.data(), MPI_UNSIGNED_LONG_LONG, MPI_COMM_WORLD);
         
         auto end = chr::high_resolution_clock::now();
         ans = chr::duration<double, ratio<1, 1000>>(end - start).count();

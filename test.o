@@ -1,13 +1,13 @@
-MPI 进程数 = 4
+MPI进程数: 4
 多项式乘法结果正确
-测试 id=0，n=4，p=7340033，耗时=2.41562 ms
+average latency for n = 4 p = 7340033 : 3.75745 (us)
 多项式乘法结果正确
-测试 id=1，n=131072，p=7340033，耗时=136.336 ms
+average latency for n = 131072 p = 7340033 : 97.5962 (us)
 多项式乘法结果正确
-测试 id=2，n=131072，p=104857601，耗时=139.986 ms
+average latency for n = 131072 p = 104857601 : 93.7511 (us)
 多项式乘法结果正确
-测试 id=3，n=131072，p=469762049，耗时=127.133 ms
+average latency for n = 131072 p = 469762049 : 92.9544 (us)
 多项式乘法结果正确
-测试 id=4，n=131072，p=1337006139375617，耗时=129.634 ms
+average latency for n = 131072 p = 1337006139375617 : 94.2418 (us)
 
 Authorized users only. All activities may be monitored and reported.
