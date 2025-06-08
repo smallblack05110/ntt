@@ -4,15 +4,15 @@
 #include <chrono>
 #include <iomanip>
 #include <sys/time.h>
+#include <mpi.h>
 #include <omp.h>
 #include <cmath>
 #include <vector>
 #include <algorithm>
 #include <tuple>
-#include <pthread.h>
 #include <unistd.h>
-#include <mpi.h>
 
+// 使用命名空间但避免使用 string
 using std::cout;
 using std::endl;
 using std::ifstream;
@@ -25,7 +25,7 @@ using std::reverse;
 namespace chr = std::chrono;
 using std::ratio;
 
-// 巴雷特模乘结构体
+// 修复的巴雷特模乘结构体
 struct BarrettReduction {
     uint64_t mod;
     uint64_t mu;
@@ -55,8 +55,11 @@ struct BarrettReduction {
 };
 
 // uint128 转字符串（输出用）
-std::string uint128_to_string(__uint128_t value) {
-    if (value == 0) return "0";
+std::string uint128_to_string(__uint128_t value)
+{
+    if (value == 0) {
+        return "0";
+    }
     char buffer[40];
     int index = 0;
     while (value > 0) {
@@ -67,10 +70,10 @@ std::string uint128_to_string(__uint128_t value) {
     return std::string(buffer, buffer + index);
 }
 
-void fRead(uint64_t *a, uint64_t *b, int *n, int64_t *p, int input_id) {
+void fRead(uint64_t *a, uint64_t *b, int *n, int64_t *p, int input_id)
+{
     char path_buffer[256];
     sprintf(path_buffer, "/nttdata/%d.in", input_id);
-    
     ifstream fin;
     fin.open(path_buffer, std::ios::in);
     fin >> *n >> *p;
@@ -83,7 +86,8 @@ void fRead(uint64_t *a, uint64_t *b, int *n, int64_t *p, int input_id) {
     fin.close();
 }
 
-void fWrite(const uint64_t *ab, int n, int input_id) {
+void fWrite(const uint64_t *ab, int n, int input_id)
+{
     char path_buffer[256];
     sprintf(path_buffer, "files/%d.out", input_id);
     
@@ -95,25 +99,27 @@ void fWrite(const uint64_t *ab, int n, int input_id) {
     fout.close();
 }
 
-void fCheck(uint64_t *ab, int n, int input_id) {
+void fCheck(uint64_t *ab, int n, int input_id){
     char path_buffer[256];
     sprintf(path_buffer, "/nttdata/%d.out", input_id);
     
     std::ifstream fin;
     fin.open(path_buffer, std::ios::in);
-    for (int i = 0; i < n * 2 - 1; i++) {
+    for (int i = 0; i < n * 2 - 1; i++){
         uint64_t x;
-        fin >> x;
-        if (x != ab[i]) {
-            std::cout << "多项式乘法结果错误" << std::endl;
+        fin>>x;
+        if(x != ab[i]){
+            std::cout<<"多项式乘法结果错误"<<std::endl;
             return;
         }
     }
-    std::cout << "多项式乘法结果正确" << std::endl;
+    std::cout<<"多项式乘法结果正确"<<std::endl;
     return;
 }
 
-__int128_t quick_mod_barrett(__int128_t a, __int128_t b, __int128_t p, const BarrettReduction &barrett) {
+// 使用巴雷特模乘的快速幂
+__int128_t quick_mod_barrett(__int128_t a, __int128_t b, __int128_t p, const BarrettReduction &barrett)
+{
     __int128_t res = 1; a %= p;
     while (b > 0) {
         if (b & 1) res = barrett.reduce(res * a);
@@ -122,20 +128,12 @@ __int128_t quick_mod_barrett(__int128_t a, __int128_t b, __int128_t p, const Bar
     return res;
 }
 
-__int128_t quick_mod(__int128_t a, __int128_t b, __int128_t p) {
-    __int128_t res = 1; a %= p;
-    while (b > 0) {
-        if (b & 1) res = (res * a) % p;
-        a = (a * a) % p; b >>= 1;
-    }
-    return res;
-}
-
-// 标准NTT实现（每个进程内部使用）
-void ntt_iter_barrett(vector<uint32_t> &a, uint64_t p, int root, bool invert, BarrettReduction &barrett) {
+// 优化的NTT实现 - 只在合适的地方使用OpenMP
+void ntt_iter_barrett(vector<uint32_t> &a, uint64_t p, int root, bool invert, BarrettReduction &barrett)
+{
     int n = a.size();
     
-    // 位反转置换
+    // 位逆序 - 保持串行，避免复杂的同步
     for (int i = 1, j = 0; i < n; ++i) {
         int bit = n >> 1;
         for (; j & bit; bit >>= 1) j ^= bit;
@@ -143,131 +141,103 @@ void ntt_iter_barrett(vector<uint32_t> &a, uint64_t p, int root, bool invert, Ba
         if (i < j) swap(a[i], a[j]);
     }
     
-    // 蝶形运算
+    // NTT变换 - 只在大规模时才并行化
     for (int len = 2; len <= n; len <<= 1) {
         uint64_t wn = quick_mod_barrett(root, (p - 1) / len, p, barrett);
         if (invert) wn = quick_mod_barrett(wn, p - 2, p, barrett);
         
-        for (int i = 0; i < n; i += len) {
-            uint32_t w = 1;
-            for (int j = 0; j < len / 2; ++j) {
-                uint32_t u = a[i + j];
-                uint64_t v = barrett.mul_mod(a[i + j + len / 2], w);
-                
-                uint32_t sum = u + v;
-                if (sum >= p) sum -= p;
-                
-                uint64_t diff = u;
-                if (u < v) diff += p;
-                diff -= v;
-                
-                a[i + j] = sum;
-                a[i + j + len/2] = diff;
-                
-                w = barrett.mul_mod(w, wn);
+        // 只有当工作量足够大时才使用OpenMP
+        if (n >= 8192 && len >= 64) {
+            #pragma omp parallel for schedule(static) if(n/len >= 4)
+            for (int i = 0; i < n; i += len) {
+                uint32_t w = 1;
+                // 预计算w的幂次，避免重复计算
+                for (int k = 0; k < len / 2; ++k) {
+                    if (k > 0) w = barrett.mul_mod(w, wn);
+                    
+                    uint32_t u = a[i + k];
+                    uint64_t v = barrett.mul_mod(a[i + k + len / 2], w);
+                    
+                    uint32_t sum = u + v;
+                    if (sum >= p) sum -= p;
+                    
+                    uint64_t diff = u;
+                    if (u < v) diff += p;
+                    diff -= v;
+                    
+                    a[i + k] = sum;
+                    a[i + k + len/2] = diff;
+                }
+            }
+        } else {
+            // 小规模数据使用串行版本
+            for (int i = 0; i < n; i += len) {
+                uint32_t w = 1;
+                for (int j = 0; j < len / 2; ++j) {
+                    uint32_t u = a[i + j];
+                    uint64_t v = barrett.mul_mod(a[i + j + len / 2], w);
+                    
+                    uint32_t sum = u + v;
+                    if (sum >= p) sum -= p;
+                    
+                    uint64_t diff = u;
+                    if (u < v) diff += p;
+                    diff -= v;
+                    
+                    a[i + j] = sum;
+                    a[i + j + len/2] = diff;
+                    
+                    w = barrett.mul_mod(w, wn);
+                }
             }
         }
     }
 }
 
-// MPI分布式多项式乘法
-void mpi_polynomial_multiply(vector<uint32_t> &a, vector<uint32_t> &b, vector<uint32_t> &result,
-                            uint64_t p, int root, BarrettReduction &barrett, int rank, int size) {
-    int n = a.size();
+// 优化的NTT计算函数
+void mpi_ntt_compute(vector<uint32_t> &a_local, vector<uint32_t> &b_local, 
+                     vector<uint32_t> &result_local, uint64_t p, int root, 
+                     BarrettReduction &barrett)
+{
+    // 对本地数据进行NTT
+    ntt_iter_barrett(a_local, p, root, false, barrett);
+    ntt_iter_barrett(b_local, p, root, false, barrett);
     
-    if (rank == 0) {
-        cout << "  进程 " << rank << ": 开始NTT变换，数据长度 = " << n << endl;
-    }
+    // 点乘 - 只有数据量大时才并行化
+    result_local.resize(a_local.size());
+    size_t data_size = a_local.size();
     
-    // 前向NTT
-    ntt_iter_barrett(a, p, root, false, barrett);
-    ntt_iter_barrett(b, p, root, false, barrett);
-    
-    // 计算每个进程负责的点乘范围
-    int chunk_size = n / size;
-    int remainder = n % size;
-    int start = rank * chunk_size + min(rank, remainder);
-    int end = start + chunk_size + (rank < remainder ? 1 : 0);
-    
-    if (rank == 0) {
-        cout << "  进程 " << rank << ": 负责点乘范围 [" << start << ", " << end << ")" << endl;
-    }
-    
-    // 点乘
-    result.resize(n);
-    for (int i = start; i < end; ++i) {
-        result[i] = barrett.mul_mod(a[i], b[i]);
-    }
-    
-    // 收集所有进程的点乘结果
-    vector<int> recvcounts(size), displs(size);
-    for (int i = 0; i < size; ++i) {
-        recvcounts[i] = chunk_size + (i < remainder ? 1 : 0);
-        displs[i] = i * chunk_size + min(i, remainder);
-    }
-    
-    MPI_Allgatherv(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL, 
-                   result.data(), recvcounts.data(), displs.data(), MPI_UINT32_T, MPI_COMM_WORLD);
-    
-    if (rank == 0) {
-        cout << "  进程 " << rank << ": 开始逆NTT变换" << endl;
-    }
-    
-    // 逆向NTT
-    ntt_iter_barrett(result, p, root, true, barrett);
-    
-    // 乘以n的逆元
-    uint64_t inv_n = quick_mod_barrett(n, p - 2, p, barrett);
-    for (int i = start; i < end; ++i) {
-        result[i] = barrett.mul_mod(result[i], inv_n);
-    }
-    
-    // 收集最终结果
-    MPI_Allgatherv(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL, 
-                   result.data(), recvcounts.data(), displs.data(), MPI_UINT32_T, MPI_COMM_WORLD);
-}
-
-// MPI分布式CRT重建
-void mpi_crt_reconstruct(vector<vector<uint32_t>> &mods, vector<uint64_t> &ab,
-                        __uint128_t M, __uint128_t *K, __uint128_t *invK,
-                        int64_t p_, int CRT_CNT, vector<BarrettReduction*> &barrett_mods,
-                        int rank, int size) {
-    int n = mods[0].size();
-    int chunk_size = n / size;
-    int remainder = n % size;
-    int start = rank * chunk_size + min(rank, remainder);
-    int end = start + chunk_size + (rank < remainder ? 1 : 0);
-    
-    if (rank == 0) {
-        cout << "  进程 " << rank << ": 开始CRT重建，负责范围 [" << start << ", " << end << ")" << endl;
-    }
-    
-    ab.resize(n);
-    
-    // 每个进程处理自己的数据块
-    for (int i = start; i < end; ++i) {
-        __uint128_t sum = 0;
-        for (int j = 0; j < CRT_CNT; ++j) {
-            __uint128_t term = mods[j][i];
-            term = barrett_mods[j]->mul_mod(term, invK[j]);
-            term = (term * K[j]) % M;
-            sum = (sum + term) % M;
+    if (data_size >= 4096) {
+        #pragma omp parallel for simd schedule(static)
+        for (size_t i = 0; i < data_size; ++i) {
+            result_local[i] = barrett.mul_mod(a_local[i], b_local[i]);
         }
-        ab[i] = uint64_t(sum % p_);
+    } else {
+        for (size_t i = 0; i < data_size; ++i) {
+            result_local[i] = barrett.mul_mod(a_local[i], b_local[i]);
+        }
     }
     
-    // 收集所有进程的CRT结果
-    vector<int> recvcounts(size), displs(size);
-    for (int i = 0; i < size; ++i) {
-        recvcounts[i] = chunk_size + (i < remainder ? 1 : 0);
-        displs[i] = i * chunk_size + min(i, remainder);
-    }
+    // 逆变换
+    ntt_iter_barrett(result_local, p, root, true, barrett);
     
-    MPI_Allgatherv(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL, 
-                   ab.data(), recvcounts.data(), displs.data(), MPI_UINT64_T, MPI_COMM_WORLD);
+    // 乘以 n^{-1}
+    uint64_t inv_n = quick_mod_barrett(data_size, p - 2, p, barrett);
+    if (data_size >= 4096) {
+        #pragma omp parallel for simd schedule(static)
+        for (size_t i = 0; i < data_size; ++i) {
+            result_local[i] = barrett.mul_mod(result_local[i], inv_n);
+        }
+    } else {
+        for (size_t i = 0; i < data_size; ++i) {
+            result_local[i] = barrett.mul_mod(result_local[i], inv_n);
+        }
+    }
 }
 
-__uint128_t power_barrett(__uint128_t base, __uint32_t exp, __uint32_t mod, BarrettReduction &barrett) {
+// CRT模逆
+__uint128_t power_barrett(__uint128_t base, __uint32_t exp, __uint32_t mod, BarrettReduction &barrett)
+{
     __uint128_t res = 1; base %= mod;
     while (exp > 0) {
         if (exp & 1) res = barrett.reduce(res * base);
@@ -276,168 +246,198 @@ __uint128_t power_barrett(__uint128_t base, __uint32_t exp, __uint32_t mod, Barr
     return res;
 }
 
-__uint128_t modinv_crt_barrett(__uint128_t a, __uint128_t m, BarrettReduction &barrett) {
+__uint128_t modinv_crt_barrett(__uint128_t a, __uint128_t m, BarrettReduction &barrett)
+{
     return power_barrett(a, m - 2, m, barrett);
+}
+
+// 优化的CRT重建函数
+void mpi_crt_reconstruction(vector<vector<uint32_t>> &mods, uint64_t *ab, 
+                           int start_idx, int end_idx, __uint128_t M, 
+                           __uint128_t *K, __uint128_t *invK, int64_t p_, 
+                           int CRT_CNT, vector<BarrettReduction*> &barrett_mods)
+{
+    int work_size = end_idx - start_idx;
+    
+    // 只有工作量足够大时才并行化
+    if (work_size >= 1024) {
+        #pragma omp parallel for schedule(static)
+        for (int i = start_idx; i < end_idx; ++i) {
+            __uint128_t sum = 0;
+            for (int j = 0; j < CRT_CNT; ++j) {
+                __uint128_t term = mods[j][i];
+                term = barrett_mods[j]->mul_mod(term, invK[j]);
+                term = (term * K[j]) % M;
+                sum = (sum + term) % M;
+            }
+            ab[i] = uint64_t(sum % p_);
+        }
+    } else {
+        for (int i = start_idx; i < end_idx; ++i) {
+            __uint128_t sum = 0;
+            for (int j = 0; j < CRT_CNT; ++j) {
+                __uint128_t term = mods[j][i];
+                term = barrett_mods[j]->mul_mod(term, invK[j]);
+                term = (term * K[j]) % M;
+                sum = (sum + term) % M;
+            }
+            ab[i] = uint64_t(sum % p_);
+        }
+    }
 }
 
 uint64_t a[300000], b[300000], ab[300000];
 
-int main(int argc, char *argv[]) {
-    // 初始化MPI
+int main(int argc, char *argv[])
+{
+    // 简化MPI初始化，避免不必要的线程支持开销
     MPI_Init(&argc, &argv);
     
     int rank, size;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
     
-    // 只有主进程输出MPI信息
-    if (rank == 0) {
-        cout << "========== MPI分布式NTT多项式乘法 ==========" << endl;
-        cout << "MPI进程数: " << size << endl;
-        cout << "OpenMP线程数: " << omp_get_max_threads() << endl;
-        cout << "===========================================" << endl;
-    }
+    // 智能设置OpenMP线程数
+    int num_threads = std::min(4, omp_get_max_threads()); // 限制线程数，避免过度并行
+    omp_set_num_threads(num_threads);
     
+    if (rank == 0) {
+        cout << "MPI进程数: " << size << endl;
+        cout << "每个进程OpenMP线程数: " << num_threads << endl;
+    }
+
     int test_begin = 0, test_end = 4;
     const int root = 3;
     const int CRT_CNT = 4;
-    
-    // 根为3的小模数列表
+
     uint64_t small_mods[CRT_CNT] = {
         469762049ULL, 998244353ULL,
         1004535809ULL, 1224736769ULL
     };
-    
-    // 为每个小模数创建巴雷特模乘计算器
+
     vector<BarrettReduction*> barrett_mods;
     for (int i = 0; i < CRT_CNT; ++i) {
         barrett_mods.push_back(new BarrettReduction(small_mods[i]));
     }
-    
-    // 计算所有小模数乘积 M
+
     __uint128_t M = 1;
     for (int i = 0; i < CRT_CNT; ++i) M *= small_mods[i];
-    
-    // 预计算 CRT 常量 K 和 invK
+
     __uint128_t K[CRT_CNT], invK[CRT_CNT];
     for (int i = 0; i < CRT_CNT; ++i) {
         K[i] = M / small_mods[i];
         invK[i] = modinv_crt_barrett(K[i], small_mods[i], *barrett_mods[i]);
     }
-    
+
     for (int id = test_begin; id <= test_end; ++id) {
         long double ans = 0;
         int n_;
         int64_t p_;
         
-        // 只有主进程读取数据
         if (rank == 0) {
             fRead(a, b, &n_, &p_, id);
-            cout << "\n测试用例 " << id << ": n=" << n_ << ", p=" << p_ << endl;
         }
         
-        // 广播数据大小和模数
         MPI_Bcast(&n_, 1, MPI_INT, 0, MPI_COMM_WORLD);
-        MPI_Bcast(&p_, 1, MPI_INT64_T, 0, MPI_COMM_WORLD);
+        MPI_Bcast(&p_, 1, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
         
-        int len = 1;
+        int len = 1; 
         while (len < 2 * n_) len <<= 1;
         
-        // 广播输入数据
-        MPI_Bcast(a, len, MPI_UINT64_T, 0, MPI_COMM_WORLD);
-        MPI_Bcast(b, len, MPI_UINT64_T, 0, MPI_COMM_WORLD);
+        if (rank == 0) {
+            fill(a + n_, a + len, 0);
+            fill(b + n_, b + len, 0);
+        }
         
-        // 同步所有进程
-        MPI_Barrier(MPI_COMM_WORLD);
+        MPI_Bcast(a, len, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
+        MPI_Bcast(b, len, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
+        
         auto start = chr::high_resolution_clock::now();
-        
-        // 存储每个小模NTT结果
+
         vector<vector<uint32_t>> mods(CRT_CNT);
         for (int i = 0; i < CRT_CNT; i++) {
             mods[i].resize(len);
         }
-        
-        if (rank == 0) {
-            cout << "开始并行NTT计算..." << endl;
-        }
-        
-        // 并行处理每个小模数的NTT（在进程内部使用OpenMP）
-        #pragma omp parallel for num_threads(min(CRT_CNT, omp_get_max_threads()))
-        for (int mod_idx = 0; mod_idx < CRT_CNT; ++mod_idx) {
-            // 转换输入数据到当前模数
-            vector<uint32_t> a_mod(len), b_mod(len);
-            for (int i = 0; i < len; i++) {
-                a_mod[i] = static_cast<uint32_t>(barrett_mods[mod_idx]->reduce(a[i]));
-                b_mod[i] = static_cast<uint32_t>(barrett_mods[mod_idx]->reduce(b[i]));
+
+        // 简化的工作分配 - 避免复杂的线程同步
+        for (int t = 0; t < CRT_CNT; ++t) {
+            if (t % size == rank) {
+                vector<uint32_t> a_vec(len), b_vec(len);
+                
+                // 数据转换 - 可以并行化
+                #pragma omp parallel for if(len >= 4096)
+                for (int i = 0; i < len; i++) {
+                    a_vec[i] = static_cast<uint32_t>(barrett_mods[t]->reduce(a[i]));
+                    b_vec[i] = static_cast<uint32_t>(barrett_mods[t]->reduce(b[i]));
+                }
+                
+                vector<uint32_t> result_vec;
+                mpi_ntt_compute(a_vec, b_vec, result_vec, small_mods[t], root, *barrett_mods[t]);
+                
+                mods[t] = std::move(result_vec);
             }
+        }
+        
+        // MPI通信保持不变
+        for (int t = 0; t < CRT_CNT; ++t) {
+            int owner_rank = t % size;
             
-            // MPI分布式多项式乘法
-            if (rank == 0) {
-                cout << "处理模数 " << small_mods[mod_idx] << " (索引 " << mod_idx << ")" << endl;
+            if (rank == owner_rank) {
+                for (int dest = 0; dest < size; ++dest) {
+                    if (dest != rank) {
+                        MPI_Send(mods[t].data(), len, MPI_UNSIGNED, dest, t, MPI_COMM_WORLD);
+                    }
+                }
+            } else {
+                MPI_Recv(mods[t].data(), len, MPI_UNSIGNED, owner_rank, t, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
             }
-            
-            mpi_polynomial_multiply(a_mod, b_mod, mods[mod_idx], 
-                                  small_mods[mod_idx], root, *barrett_mods[mod_idx], rank, size);
         }
         
-        if (rank == 0) {
-            cout << "开始CRT重建..." << endl;
-        }
+        int data_per_process = len / size;
+        int extra_data = len % size;
+        int start_idx = rank * data_per_process + min(rank, extra_data);
+        int end_idx = start_idx + data_per_process + (rank < extra_data ? 1 : 0);
         
-        // MPI分布式CRT重建
-        vector<uint64_t> ab_vec;
-        mpi_crt_reconstruct(mods, ab_vec, M, K, invK, p_, CRT_CNT, barrett_mods, rank, size);
+        mpi_crt_reconstruction(mods, ab, start_idx, end_idx, M, K, invK, p_, CRT_CNT, barrett_mods);
         
-        // 转换回数组格式
-        for (int i = 0; i < 2 * n_ - 1; ++i) {
-            ab[i] = ab_vec[i];
-        }
-        
-        // 最终模数约简
-        BarrettReduction barrett_final(p_);
-        int chunk_size = (2 * n_ - 1) / size;
-        int remainder = (2 * n_ - 1) % size;
-        int start_idx = rank * chunk_size + min(rank, remainder);
-        int end_idx = start_idx + chunk_size + (rank < remainder ? 1 : 0);
-        
-        for (int i = start_idx; i < end_idx; ++i) {
-            ab[i] = barrett_final.reduce(ab[i]);
-        }
-        
-        // 收集最终结果
         vector<int> recvcounts(size), displs(size);
         for (int i = 0; i < size; ++i) {
-            recvcounts[i] = chunk_size + (i < remainder ? 1 : 0);
-            displs[i] = i * chunk_size + min(i, remainder);
+            int local_data = data_per_process + (i < extra_data ? 1 : 0);
+            recvcounts[i] = local_data;
+            displs[i] = (i == 0) ? 0 : displs[i-1] + recvcounts[i-1];
         }
         
-        MPI_Allgatherv(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL, 
-                       ab, recvcounts.data(), displs.data(), MPI_UINT64_T, MPI_COMM_WORLD);
+        MPI_Allgatherv(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL, ab, recvcounts.data(), 
+                       displs.data(), MPI_UNSIGNED_LONG_LONG, MPI_COMM_WORLD);
         
-        // 同步所有进程
-        MPI_Barrier(MPI_COMM_WORLD);
+        BarrettReduction barrett_final(p_);
+        
+        // 最后的还原操作 - 只有数据量大时才并行化
+        if (n_ >= 2048) {
+            #pragma omp parallel for simd schedule(static)
+            for (int i = 0; i < 2 * n_ - 1; ++i) {
+                ab[i] = barrett_final.reduce(ab[i]);
+            }
+        } else {
+            for (int i = 0; i < 2 * n_ - 1; ++i) {
+                ab[i] = barrett_final.reduce(ab[i]);
+            }
+        }
+        
         auto end = chr::high_resolution_clock::now();
         ans = chr::duration<double, ratio<1, 1000>>(end - start).count();
-        
-        // 只有主进程进行检查和输出
+
         if (rank == 0) {
             fCheck(ab, n_, id);
-            cout << "average latency for n = " << n_ << " p = " << p_ << " : " << ans << " ms" << endl;
+            cout << "average latency for n = " << n_ << " p = " << p_ << " : " << ans << " (us)" << endl;
             fWrite(ab, n_, id);
-            cout << "----------------------------------------" << endl;
         }
     }
-    
-    // 释放资源
+
     for (auto &b : barrett_mods) {
         delete b;
     }
     
-    if (rank == 0) {
-        cout << "所有测试完成！" << endl;
-    }
-    
-    // 结束MPI
     MPI_Finalize();
     return 0;
 }
