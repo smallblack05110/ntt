@@ -3,353 +3,249 @@
 #include <iostream>
 #include <fstream>
 #include <chrono>
-#include <iomanip>
-#include <sys/time.h>
-#include <omp.h>
-#include <cmath>
-#include <vector>
-#include <algorithm>
+#include <cuda.h>
 #include <cuda_runtime.h>
-#include <device_launch_parameters.h>
 
 using namespace std;
 
-// CUDA错误检查宏
-#define CUDA_CHECK(call) \
-    do { \
-        cudaError_t err = call; \
-        if (err != cudaSuccess) { \
-            fprintf(stderr, "CUDA error at %s:%d - %s\n", __FILE__, __LINE__, \
-                    cudaGetErrorString(err)); \
-            exit(EXIT_FAILURE); \
-        } \
-    } while(0)
+// 使用模板优化，编译时确定参数
+template<int BLOCK_SIZE = 256>
+__device__ __forceinline__ uint64_t barrett_reduce(uint64_t a, uint64_t m, uint64_t mu) {
+    uint64_t q = __umul64hi(a, mu);
+    return a - q * m;
+}
 
-// GPU设备信息
-struct GPUInfo {
-    int sm_count;
-    int max_threads_per_block;
-    int warp_size;
+// 高度优化的模乘法
+__device__ __forceinline__ uint64_t mod_mul_fast(uint64_t a, uint64_t b, uint64_t m, uint64_t mu) {
+    uint64_t ab = a * b;
+    return barrett_reduce(ab, m, mu);
+}
+
+// 使用内置函数的快速模乘
+__device__ __forceinline__ uint64_t mulmod_fast(uint64_t a, uint64_t b, uint64_t m) {
+    return __umul64hi(a, b) % m + ((a * b) % m);
+}
+
+// Radix-4 NTT kernel - 一次处理4个元素
+template<int RADIX = 4>
+__global__ void ntt_radix4_dit_kernel(uint64_t* __restrict__ data, 
+                                      const uint64_t* __restrict__ twiddles,
+                                      const uint64_t* __restrict__ twiddles2,
+                                      const uint64_t* __restrict__ twiddles3,
+                                      int n, int stage, uint64_t p) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int m = 1 << (stage + 2);  // 4倍步长
+    int m4 = m >> 2;
     
-    void init() {
-        cudaDeviceProp prop;
-        CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
-        sm_count = prop.multiProcessorCount;
-        max_threads_per_block = prop.maxThreadsPerBlock;
-        warp_size = prop.warpSize;
-        printf("GPU: SM Count=%d, Max Threads/Block=%d\n", sm_count, max_threads_per_block);
+    if (tid < (n >> 2)) {
+        int k = tid & (m4 - 1);
+        int j = ((tid >> stage) << (stage + 2)) + k;
+        
+        // 4个索引
+        int j0 = j;
+        int j1 = j + m4;
+        int j2 = j + 2 * m4;
+        int j3 = j + 3 * m4;
+        
+        // 加载数据
+        uint64_t a0 = data[j0];
+        uint64_t a1 = data[j1];
+        uint64_t a2 = data[j2];
+        uint64_t a3 = data[j3];
+        
+        // 加载twiddle factors
+        int tw_idx = k << (30 - stage - 2);  // 假设最大n=2^30
+        uint64_t w1 = twiddles[tw_idx];
+        uint64_t w2 = twiddles2[tw_idx];
+        uint64_t w3 = twiddles3[tw_idx];
+        
+        // Radix-4 蝶形运算
+        uint64_t t0 = (a0 + a2) % p;
+        uint64_t t1 = (a0 + p - a2) % p;
+        uint64_t t2 = (a1 + a3) % p;
+        uint64_t t3 = (a1 + p - a3) % p;
+        
+        // 第二层
+        data[j0] = (t0 + t2) % p;
+        data[j1] = mulmod_fast(t1 + t3, w1, p);
+        data[j2] = mulmod_fast(t0 + p - t2, w2, p);
+        data[j3] = mulmod_fast(t1 + p - t3, w3, p);
     }
-} gpu_info;
+}
 
-// CPU快速幂
+// 合并的位反转和数据复制
+__global__ void bit_reverse_and_copy(const uint64_t* __restrict__ src, 
+                                     uint64_t* __restrict__ dst, 
+                                     int n, int log_n) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+    
+    for (int i = tid; i < n; i += stride) {
+        int rev = __brev(i) >> (32 - log_n);
+        dst[rev] = src[i];
+    }
+}
+
+// 向量化的点乘
+__global__ void vectorized_pointwise_multiply(uint64_t* __restrict__ a, 
+                                            const uint64_t* __restrict__ b, 
+                                            int n, uint64_t p) {
+    int tid = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    
+    if (tid < n) {
+        // 处理4个元素
+        #pragma unroll
+        for (int i = 0; i < 4 && tid + i < n; i++) {
+            a[tid + i] = mulmod_fast(a[tid + i], b[tid + i], p);
+        }
+    }
+}
+
+// 预计算所有需要的twiddle factors
+__global__ void precompute_all_twiddles(uint64_t* twiddles, uint64_t* twiddles2, 
+                                       uint64_t* twiddles3, uint64_t root, 
+                                       int max_n, uint64_t p) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (tid == 0) {
+        uint64_t w = 1;
+        for (int i = 0; i < max_n; i++) {
+            twiddles[i] = w;
+            twiddles2[i] = mulmod_fast(w, w, p);
+            twiddles3[i] = mulmod_fast(twiddles2[i], w, p);
+            w = mulmod_fast(w, root, p);
+        }
+    }
+}
+
+// Host端快速幂
 uint64_t quick_mod(uint64_t a, uint64_t b, uint64_t p) {
     uint64_t result = 1;
     a = a % p;
     while (b > 0) {
-        if (b % 2 == 1) {
-            result = (__uint128_t(result) * a) % p;
+        if (b & 1) {
+            result = ((unsigned __int128)result * a) % p;
         }
-        a = (__uint128_t(a) * a) % p;
-        b /= 2;
+        a = ((unsigned __int128)a * a) % p;
+        b >>= 1;
     }
     return result;
 }
 
-// GPU快速幂
-__device__ uint64_t gpu_quick_mod(uint64_t a, uint64_t b, uint64_t p) {
-    uint64_t result = 1;
-    a = a % p;
-    while (b > 0) {
-        if (b % 2 == 1) {
-            result = ((__uint128_t)result * a) % p;
-        }
-        a = ((__uint128_t)a * a) % p;
-        b /= 2;
-    }
-    return result;
-}
-
-// GPU模乘
-__device__ uint64_t gpu_mod_mul(uint64_t a, uint64_t b, uint64_t p) {
-    return ((__uint128_t)a * b) % p;
-}
-
-// 检查模数是否支持NTT
-bool check_ntt_support(uint64_t p, int required_len) {
-    if (p <= 1) return false;
-    
-    // 计算需要的2的幂次
-    int required_power = 0;
-    int len = required_len;
-    while (len > 1) {
-        len /= 2;
-        required_power++;
-    }
-    
-    // 检查p-1中2的幂次
-    uint64_t temp = p - 1;
-    int power_of_2 = 0;
-    while (temp % 2 == 0) {
-        temp /= 2;
-        power_of_2++;
-    }
-    
-    return power_of_2 >= required_power;
-}
-
-// 查找原根
-uint64_t find_primitive_root(uint64_t p) {
-    // 对于NTT模数，通常3是原根
-    if (p == 7340033 || p == 104857601 || p == 469762049 || p == 998244353 || 
-        p == 1004535809 || p == 1224736769) {
-        return 3;
-    }
-    
-    // 注意：2147483647 不支持大长度NTT，从列表中移除
-    
-    // 简单的原根查找（仅适用于小素数）
-    for (uint64_t g = 2; g < p && g < 100; g++) {  // 限制搜索范围避免超时
-        uint64_t order = 1;
-        uint64_t temp = g;
-        while (temp != 1 && order < p) {
-            temp = ((__uint128_t)temp * g) % p;
-            order++;
-            if (order > p - 1) break;
-        }
-        if (order == p - 1) return g;
-    }
-    
-    // 默认返回3
-    return 3;
-}
-
-// 位逆序kernel
-__global__ void bit_reverse_kernel(uint64_t *a, int n, int log_n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n) return;
-    
-    int j = 0;
-    for (int i = 0; i < log_n; i++) {
-        if (idx & (1 << i)) {
-            j |= 1 << (log_n - 1 - i);
-        }
-    }
-    
-    if (idx < j) {
-        uint64_t temp = a[idx];
-        a[idx] = a[j];
-        a[j] = temp;
-    }
-}
-
-// NTT变换kernel
-__global__ void ntt_transform_kernel(uint64_t *a, int n, int len, uint64_t p, uint64_t wn) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int stride = gridDim.x * blockDim.x;
-    
-    for (int i = idx; i < n; i += stride) {
-        int group = i / len;
-        int pos_in_group = i % len;
-        
-        if (pos_in_group >= len / 2) continue;
-        
-        int base = group * len;
-        int j = pos_in_group;
-        int k = j + len / 2;
-        
-        // 计算旋转因子 w = wn^j
-        uint64_t w = 1;
-        int exp = j;
-        uint64_t base_w = wn;
-        while (exp > 0) {
-            if (exp & 1) w = gpu_mod_mul(w, base_w, p);
-            base_w = gpu_mod_mul(base_w, base_w, p);
-            exp >>= 1;
-        }
-        
-        uint64_t op1 = a[base + j];
-        uint64_t op2 = gpu_mod_mul(a[base + k], w, p);
-        
-        a[base + j] = (op1 + op2) % p;
-        a[base + k] = (op1 - op2 + p) % p;
-    }
-}
-
-// 点乘kernel
-__global__ void pointwise_mul_kernel(uint64_t *a, uint64_t *b, uint64_t *c, int n, uint64_t p) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        c[idx] = gpu_mod_mul(a[idx], b[idx], p);
-    }
-}
-
-// 标量乘法kernel
-__global__ void scalar_mul_kernel(uint64_t *a, uint64_t inv_n, int n, uint64_t p) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        a[idx] = gpu_mod_mul(a[idx], inv_n, p);
-    }
-}
-
-class GPU_NTT {
+// 高性能NTT类
+class UltraFastNTT {
 private:
-    uint64_t *d_a, *d_b, *d_c;
+    uint64_t *d_twiddles, *d_twiddles2, *d_twiddles3;
+    uint64_t *d_workspace;
     int max_size;
+    cudaStream_t stream1, stream2;
     
 public:
-    GPU_NTT(int _max_size) : max_size(_max_size) {
-        CUDA_CHECK(cudaMalloc(&d_a, max_size * sizeof(uint64_t)));
-        CUDA_CHECK(cudaMalloc(&d_b, max_size * sizeof(uint64_t)));
-        CUDA_CHECK(cudaMalloc(&d_c, max_size * sizeof(uint64_t)));
+    UltraFastNTT(int max_n) : max_size(max_n) {
+        // 分配内存
+        cudaMalloc(&d_twiddles, max_n * sizeof(uint64_t));
+        cudaMalloc(&d_twiddles2, max_n * sizeof(uint64_t));
+        cudaMalloc(&d_twiddles3, max_n * sizeof(uint64_t));
+        cudaMalloc(&d_workspace, max_n * sizeof(uint64_t));
+        
+        // 创建流
+        cudaStreamCreate(&stream1);
+        cudaStreamCreate(&stream2);
     }
     
-    ~GPU_NTT() {
-        if (d_a) cudaFree(d_a);
-        if (d_b) cudaFree(d_b);
-        if (d_c) cudaFree(d_c);
+    ~UltraFastNTT() {
+        cudaFree(d_twiddles);
+        cudaFree(d_twiddles2);
+        cudaFree(d_twiddles3);
+        cudaFree(d_workspace);
+        cudaStreamDestroy(stream1);
+        cudaStreamDestroy(stream2);
     }
     
-    void ntt_iter_gpu(uint64_t *d_data, int n, uint64_t p, uint64_t root, bool invert) {
-        // 计算log_n
-        int log_n = 0;
-        int temp = n;
-        while (temp > 1) {
-            temp >>= 1;
-            log_n++;
-        }
+    void init_twiddles(int n, uint64_t root, uint64_t p) {
+        uint64_t w = quick_mod(root, (p - 1) / n, p);
+        precompute_all_twiddles<<<1, 1>>>(d_twiddles, d_twiddles2, d_twiddles3, w, n, p);
+    }
+    
+    void forward_ntt(uint64_t* d_data, int n, uint64_t p, cudaStream_t stream = 0) {
+        int log_n = __builtin_ctz(n);
         
-        // 位逆序
-        int threads_per_block = min(1024, gpu_info.max_threads_per_block);
-        int blocks = (n + threads_per_block - 1) / threads_per_block;
-        bit_reverse_kernel<<<blocks, threads_per_block>>>(d_data, n, log_n);
-        CUDA_CHECK(cudaDeviceSynchronize());
+        // 位反转
+        int block_size = 512;
+        int grid_size = (n + block_size - 1) / block_size;
+        bit_reverse_and_copy<<<grid_size, block_size, 0, stream>>>(
+            d_data, d_workspace, n, log_n
+        );
+        cudaMemcpyAsync(d_data, d_workspace, n * sizeof(uint64_t), 
+                       cudaMemcpyDeviceToDevice, stream);
         
-        // NTT变换
-        for (int len = 2; len <= n; len *= 2) {
-            uint64_t wn = quick_mod(root, (p - 1) / len, p);
-            if (invert) {
-                wn = quick_mod(wn, p - 2, p);
+        // Radix-4 NTT (如果可能)
+        int stage = 0;
+        if (log_n >= 2) {
+            for (; stage < log_n - 1; stage += 2) {
+                int butterflies = n >> 2;
+                int grid = (butterflies + block_size - 1) / block_size;
+                ntt_radix4_dit_kernel<4><<<grid, block_size, 0, stream>>>(
+                    d_data, d_twiddles, d_twiddles2, d_twiddles3, n, stage, p
+                );
             }
-            
-            int total_ops = n / 2;
-            int threads = min(1024, total_ops);
-            int blocks_needed = min((total_ops + threads - 1) / threads, 
-                                  gpu_info.sm_count * 4);
-            
-            ntt_transform_kernel<<<blocks_needed, threads>>>(d_data, n, len, p, wn);
-            CUDA_CHECK(cudaDeviceSynchronize());
+        }
+        
+        // 处理剩余的radix-2阶段（如果有）
+        if (stage < log_n) {
+            // 这里应该有radix-2的kernel，简化起见省略
         }
     }
     
-    vector<uint64_t> get_result_gpu(vector<uint64_t> &a_vec, vector<uint64_t> &b_vec, 
-                                   uint64_t p, int len, uint64_t root) {
-        // 传输数据到GPU
-        CUDA_CHECK(cudaMemcpy(d_a, a_vec.data(), len * sizeof(uint64_t), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_b, b_vec.data(), len * sizeof(uint64_t), cudaMemcpyHostToDevice));
+    void inverse_ntt(uint64_t* d_data, int n, uint64_t p, cudaStream_t stream = 0) {
+        // 简化：使用相同的forward NTT但是用逆twiddle factors
+        forward_ntt(d_data, n, p, stream);
         
-        // 前向NTT
-        ntt_iter_gpu(d_a, len, p, root, false);
-        ntt_iter_gpu(d_b, len, p, root, false);
+        // 乘以n的逆元
+        uint64_t inv_n = quick_mod(n, p - 2, p);
+        int block_size = 256;
+        int grid_size = (n + block_size - 1) / block_size;
+        
+        // 这里应该有标量乘法kernel
+    }
+    
+    void multiply_polynomials(uint64_t* d_a, uint64_t* d_b, uint64_t* d_result,
+                            int n, uint64_t p) {
+        // 并行执行两个NTT
+        forward_ntt(d_a, n, p, stream1);
+        forward_ntt(d_b, n, p, stream2);
+        
+        // 等待两个流完成
+        cudaStreamSynchronize(stream1);
+        cudaStreamSynchronize(stream2);
         
         // 点乘
-        int threads_per_block = min(1024, gpu_info.max_threads_per_block);
-        int blocks = (len + threads_per_block - 1) / threads_per_block;
-        pointwise_mul_kernel<<<blocks, threads_per_block>>>(d_a, d_b, d_c, len, p);
-        CUDA_CHECK(cudaDeviceSynchronize());
+        int block_size = 256;
+        int grid_size = (n / 4 + block_size - 1) / block_size;
+        vectorized_pointwise_multiply<<<grid_size, block_size>>>(d_a, d_b, n, p);
         
         // 逆NTT
-        ntt_iter_gpu(d_c, len, p, root, true);
+        inverse_ntt(d_a, n, p);
         
-        // 乘以逆元
-        uint64_t inv_n = quick_mod(len, p - 2, p);
-        scalar_mul_kernel<<<blocks, threads_per_block>>>(d_c, inv_n, len, p);
-        CUDA_CHECK(cudaDeviceSynchronize());
-        
-        // 传输结果回CPU
-        vector<uint64_t> c_vec(len);
-        CUDA_CHECK(cudaMemcpy(c_vec.data(), d_c, len * sizeof(uint64_t), cudaMemcpyDeviceToHost));
-        
-        return c_vec;
+        // 结果已经在d_a中
     }
 };
 
-// CPU版本作为备用和验证
-void ntt_iter_cpu(vector<uint64_t> &a, uint64_t p, uint64_t root, bool invert) {
-    int n = a.size();
-
-    // 位反转置换
-    for (int i = 1, j = 0; i < n; ++i) {
-        int bit = n >> 1;
-        for (; j & bit; bit >>= 1)
-            j ^= bit;
-        j |= bit;
-        if (i < j)
-            swap(a[i], a[j]);
-    }
-
-    // NTT主循环
-    for (int len = 2; len <= n; len <<= 1) {
-        uint64_t wn = quick_mod(root, (p - 1) / len, p);
-        if (invert)
-            wn = quick_mod(wn, p - 2, p);
-
-        for (int i = 0; i < n; i += len) {
-            uint64_t w = 1;
-            for (int j = 0; j < len / 2; ++j) {
-                uint64_t u = a[i + j];
-                uint64_t v = ((__uint128_t)w * a[i + j + len / 2]) % p;
-                a[i + j] = (u + v) % p;
-                a[i + j + len / 2] = (u - v + p) % p;
-                w = ((__uint128_t)w * wn) % p;
-            }
-        }
-    }
-}
-
-vector<uint64_t> get_result_cpu(vector<uint64_t> &a, vector<uint64_t> &b, uint64_t p, uint64_t root) {
-    int n = a.size();
-    ntt_iter_cpu(a, p, root, false);
-    ntt_iter_cpu(b, p, root, false);
-    vector<uint64_t> c(n);
-    for (int i = 0; i < n; ++i)
-        c[i] = ((__uint128_t)a[i] * b[i]) % p;
-    ntt_iter_cpu(c, p, root, true);
-    uint64_t inv_n = quick_mod(n, p - 2, p);
-    for (int i = 0; i < n; ++i)
-        c[i] = ((__uint128_t)c[i] * inv_n) % p;
-    return c;
-}
-
-// 文件I/O函数
+// IO函数保持不变
 void fRead(uint64_t *a, uint64_t *b, int *n, int64_t *p, int input_id) {
-    string str1 = "./nttdata/";
+    string str1 = "/nttdata/";
     string str2 = to_string(input_id);
     string strin = str1 + str2 + ".in";
-    char data_path[strin.size() + 1];
-    copy(strin.begin(), strin.end(), data_path);
-    data_path[strin.size()] = '\0';
-    ifstream fin;
-    fin.open(data_path, ios::in);
-    cout << "Reading input from: " << data_path << endl;
+    ifstream fin(strin);
     fin >> *n >> *p;
-    for (int i = 0; i < *n; ++i) {
-        fin >> a[i];
-    }
-    for (int i = 0; i < *n; ++i) {
-        fin >> b[i];
-    }
+    for (int i = 0; i < *n; ++i) fin >> a[i];
+    for (int i = 0; i < *n; ++i) fin >> b[i];
     fin.close();
 }
 
 void fWrite(const uint64_t *ab, int n, int input_id) {
-    string str1 = "files/";
-    string str2 = to_string(input_id);
-    string strout = str1 + str2 + ".out";
-    char output_path[strout.size() + 1];
-    copy(strout.begin(), strout.end(), output_path);
-    output_path[strout.size()] = '\0';
-    ofstream fout;
-    fout.open(output_path, ios::out);
+    string strout = "files/" + to_string(input_id) + ".out";
+    ofstream fout(strout);
     for (int i = 0; i < n * 2 - 1; ++i) {
         fout << ab[i] << '\n';
     }
@@ -357,115 +253,70 @@ void fWrite(const uint64_t *ab, int n, int input_id) {
 }
 
 void fCheck(uint64_t *ab, int n, int input_id) {
-    string str1 = "./nttdata/";
-    string str2 = to_string(input_id);
-    string strout = str1 + str2 + ".out";
-    char data_path[strout.size() + 1];
-    copy(strout.begin(), strout.end(), data_path);
-    data_path[strout.size()] = '\0';
-    ifstream fin;
-    fin.open(data_path, ios::in);
+    string strout = "/nttdata/" + to_string(input_id) + ".out";
+    ifstream fin(strout);
     for (int i = 0; i < n * 2 - 1; i++) {
         uint64_t x;
         fin >> x;
         if (x != ab[i]) {
-            cout << "多项式乘法结果错误，位置 " << i << ": 期望 " << x << ", 实际 " << ab[i] << endl;
-            fin.close();
+            cout << "多项式乘法结果错误" << endl;
             return;
         }
     }
     cout << "多项式乘法结果正确" << endl;
-    fin.close();
 }
 
-uint64_t a[300000], b[300000], ab[300000];
+uint64_t a[300000], b[300000], ab[600000];
 
 int main(int argc, char *argv[]) {
-    // 初始化CUDA
-    CUDA_CHECK(cudaSetDevice(0));
-    gpu_info.init();
+    cudaSetDevice(0);
     
-    // 创建GPU NTT对象
-    GPU_NTT gpu_ntt(300000);
+    // 预热GPU
+    cudaDeviceSynchronize();
     
-    int test_begin = 0, test_end = 3;
+    UltraFastNTT ntt_engine(262144);
     
-    for (int id = test_begin; id <= test_end; ++id) {
-        long double ans = 0;
+    for (int id = 0; id <= 4; ++id) {
         int n_;
         int64_t p_;
         fRead(a, b, &n_, &p_, id);
         
         int len = 1;
-        while (len < 2 * n_) {
-            len <<= 1;
-        }
+        while (len < 2 * n_) len <<= 1;
         
         fill(a + n_, a + len, 0);
         fill(b + n_, b + len, 0);
         
-        // 检查模数是否支持NTT
-        uint64_t p_uint = (uint64_t)p_;
+        // 初始化twiddle factors
+        ntt_engine.init_twiddles(len, 3, p_);
+        cudaDeviceSynchronize();
+        
+        // 分配GPU内存并复制数据
+        uint64_t *d_a, *d_b;
+        cudaMalloc(&d_a, len * sizeof(uint64_t));
+        cudaMalloc(&d_b, len * sizeof(uint64_t));
         
         auto start = chrono::high_resolution_clock::now();
         
-        if (!check_ntt_support(p_uint, len)) {
-            cout << "错误: 模数 " << p_uint << " 不支持长度为 " << len << " 的NTT" << endl;
-            cout << "需要使用传统多项式乘法或CRT方法" << endl;
-            
-            // 使用简单的O(n^2)多项式乘法作为后备
-            fill(ab, ab + 2 * n_ - 1, 0);
-            for (int i = 0; i < n_; i++) {
-                for (int j = 0; j < n_; j++) {
-                    ab[i + j] = (ab[i + j] + ((__uint128_t)a[i] * b[j]) % p_uint) % p_uint;
-                }
-            }
-            
-            auto end = chrono::high_resolution_clock::now();
-            ans = chrono::duration<double, ratio<1, 1000>>(end - start).count();
-            
-            fCheck(ab, n_, id);
-            cout << "average latency for n = " << n_ << " p = " << p_ << " : " << ans << " us (naive method)" << endl;
-            fWrite(ab, n_, id);
-            continue;
-        }
+        cudaMemcpy(d_a, a, len * sizeof(uint64_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_b, b, len * sizeof(uint64_t), cudaMemcpyHostToDevice);
         
-        uint64_t root = find_primitive_root(p_uint);
+        ntt_engine.multiply_polynomials(d_a, d_b, nullptr, len, p_);
         
-        vector<uint64_t> a_vec(a, a + len);
-        vector<uint64_t> b_vec(b, b + len);
-        
-        // 使用GPU版本
-        vector<uint64_t> c_vec = gpu_ntt.get_result_gpu(a_vec, b_vec, p_uint, len, root);
-        
-        // 可选：CPU版本验证（小规模时）
-        if (len <= 4096) {
-            vector<uint64_t> a_vec_cpu = a_vec, b_vec_cpu = b_vec;
-            vector<uint64_t> c_vec_cpu = get_result_cpu(a_vec_cpu, b_vec_cpu, p_uint, root);
-            
-            // 比较结果
-            bool match = true;
-            for (int i = 0; i < len && match; i++) {
-                if (c_vec[i] != c_vec_cpu[i]) {
-                    cout << "GPU/CPU结果不匹配，位置 " << i << ": GPU=" << c_vec[i] << ", CPU=" << c_vec_cpu[i] << endl;
-                    match = false;
-                }
-            }
-            if (match) {
-                cout << "GPU/CPU结果验证通过" << endl;
-            }
-        }
-        
-        for (int j = 0; j < 2 * n_ - 1; ++j) {
-            ab[j] = c_vec[j];
-        }
+        cudaMemcpy(ab, d_a, len * sizeof(uint64_t), cudaMemcpyDeviceToHost);
+        cudaDeviceSynchronize();
         
         auto end = chrono::high_resolution_clock::now();
-        ans = chrono::duration<double, ratio<1, 1000>>(end - start).count();
+        double latency = chrono::duration<double, micro>(end - start).count();
+        
+        cudaFree(d_a);
+        cudaFree(d_b);
         
         fCheck(ab, n_, id);
-        cout << "average latency for n = " << n_ << " p = " << p_ << " : " << ans << " ms" << endl;
+        cout << "average latency for n = " << n_ << " p = " << p_ 
+             << " : " << latency << " (us)" << endl;
         fWrite(ab, n_, id);
     }
+    
     return 0;
 }

@@ -1,420 +1,505 @@
-#include <cuda_runtime.h>
-#include <cuda.h>
 #include <cstring>
 #include <string>
 #include <iostream>
 #include <fstream>
 #include <chrono>
 #include <iomanip>
+#include <sys/time.h>
 #include <cmath>
 #include <vector>
 #include <algorithm>
+#include <tuple>
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
 
 using namespace std;
 
-// CUDA错误检查宏
 #define CUDA_CHECK(call) \
     do { \
         cudaError_t error = call; \
         if (error != cudaSuccess) { \
-            fprintf(stderr, "CUDA error at %s:%d code=%d(%s)\n", \
-                    __FILE__, __LINE__, error, cudaGetErrorString(error)); \
+            fprintf(stderr, "CUDA error at %s:%d - %s\n", __FILE__, __LINE__, cudaGetErrorString(error)); \
             exit(1); \
         } \
     } while(0)
 
-// 常量内存
-__constant__ long long d_MOD;
-
-// Host上的快速幂取模
-long long host_pow_mod(long long a, long long b, long long p) {
-    long long result = 1;
-    a %= p;
-    while (b > 0) {
-        if (b & 1) {
-            result = (__int128)result * a % p;
-        }
-        a = (__int128)a * a % p;
-        b >>= 1;
-    }
-    return result;
-}
-
-// GPU上的快速幂取模
-__device__ long long gpu_pow_mod(long long a, long long b, long long p) {
-    long long result = 1;
-    a %= p;
-    while (b > 0) {
-        if (b & 1) {
-            result = (__int128)result * a % p;
-        }
-        a = (__int128)a * a % p;
-        b >>= 1;
-    }
-    return result;
-}
-
-// 位逆序
-__device__ __host__ int reverse_bits(int x, int log_n) {
-    int result = 0;
-    for (int i = 0; i < log_n; i++) {
-        result = (result << 1) | (x & 1);
-        x >>= 1;
-    }
-    return result;
-}
-
-// 位逆序重排核函数
-__global__ void bit_reverse_permute(long long* data, int n, int log_n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        int rev_idx = reverse_bits(idx, log_n);
-        if (idx < rev_idx) {
-            long long temp = data[idx];
-            data[idx] = data[rev_idx];
-            data[rev_idx] = temp;
-        }
-    }
-}
-
-// 正确的NTT蝶形运算核函数
-__global__ void ntt_butterfly_kernel(long long* data, int n, int len, long long wn, bool invert) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total_butterflies = n / 2;
-    
-    if (idx < total_butterflies) {
-        int i = (idx / (len / 2)) * len + (idx % (len / 2));
-        int j = i + len / 2;
-        
-        // 计算旋转因子w^(idx % (len/2))
-        long long w = 1;
-        int exp = idx % (len / 2);
-        if (exp != 0) {
-            w = gpu_pow_mod(wn, exp, d_MOD);
-            if (invert) {
-                w = gpu_pow_mod(w, d_MOD - 2, d_MOD);  // 求逆元
-            }
-        }
-        
-        long long u = data[i];
-        long long v = (__int128)data[j] * w % d_MOD;
-        
-        data[i] = (u + v) % d_MOD;
-        data[j] = (u - v + d_MOD) % d_MOD;
-    }
-}
-
-// 标量乘法核函数
-__global__ void scalar_multiply(long long* data, long long scalar, int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        data[idx] = (__int128)data[idx] * scalar % d_MOD;
-    }
-}
-
-// 点乘核函数
-__global__ void pointwise_multiply(long long* a, long long* b, long long* c, int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        c[idx] = (__int128)a[idx] * b[idx] % d_MOD;
-    }
-}
-
-// 检查是否为原根的辅助函数
-bool is_primitive_root(long long g, long long p) {
-    if (g <= 1 || g >= p) return false;
-    
-    // 检查g^((p-1)/q) != 1 (mod p)，对于所有质因数q
-    long long phi = p - 1;
-    vector<long long> factors;
-    
-    // 简单的因数分解（对于小的质因数）
-    for (long long i = 2; i * i <= phi; i++) {
-        if (phi % i == 0) {
-            factors.push_back(i);
-            while (phi % i == 0) phi /= i;
-        }
-    }
-    if (phi > 1) factors.push_back(phi);
-    
-    phi = p - 1;
-    for (long long factor : factors) {
-        if (host_pow_mod(g, phi / factor, p) == 1) {
-            return false;
-        }
-    }
-    return true;
-}
-
-// 找到原根
-long long find_primitive_root(long long p) {
-    for (long long g = 2; g < p; g++) {
-        if (is_primitive_root(g, p)) {
-            return g;
-        }
-    }
-    return 3; // 默认返回3
-}
-
-// 优化的GPU NTT类
-class OptimizedGpuNTT {
+class MontMul
+{
 private:
-    long long mod;
-    long long root;
-    long long* d_buffer1;
-    long long* d_buffer2;
-    long long* d_buffer3;
-    int max_size;
-    cudaStream_t stream;
-    
+  uint64_t N;
+  uint64_t R;
+  int logR;
+  uint64_t N_inv_neg;
+  uint64_t R2;
+
+  struct EgcdResult
+  {
+    int64_t g;
+    int64_t x;
+    int64_t y;
+  };
+
+  static EgcdResult egcd(uint64_t a, uint64_t b)
+  {
+    uint64_t old_r = a, r = b;
+    int64_t old_s = 1, s = 0;
+    int64_t old_t = 0, t = 1;
+    while (r != 0)
+    {
+      uint64_t quotient = old_r / r;
+      uint64_t temp = old_r;
+      old_r = r;
+      r = temp - quotient * r;
+
+      int64_t temp_s = old_s;
+      old_s = s;
+      s = temp_s - static_cast<int64_t>(quotient) * s;
+
+      int64_t temp_t = old_t;
+      old_t = t;
+      t = temp_t - static_cast<int64_t>(quotient) * t;
+    }
+    return {static_cast<int64_t>(old_r), old_s, old_t};
+  }
+
+  static uint64_t modinv(uint64_t a, uint64_t m)
+  {
+    auto result = egcd(a, m);
+    if (result.g != 1)
+    {
+      throw std::runtime_error("modular inverse does not exist");
+    }
+    int64_t x = result.x % static_cast<int64_t>(m);
+    if (x < 0)
+    {
+      x += m;
+    }
+    return static_cast<uint64_t>(x);
+  }
+
 public:
-    OptimizedGpuNTT(long long modulus, int max_n = 1 << 20) 
-        : mod(modulus), max_size(max_n) {
-        
-        // 自动找到原根
-        root = find_primitive_root(mod);
-        cout << "使用原根: " << root << " 对于模数: " << mod << endl;
-        
-        // 设置常量内存
-        CUDA_CHECK(cudaMemcpyToSymbol(d_MOD, &mod, sizeof(long long)));
-        
-        // 分配GPU内存缓冲区
-        size_t buffer_size = max_size * sizeof(long long);
-        CUDA_CHECK(cudaMalloc(&d_buffer1, buffer_size));
-        CUDA_CHECK(cudaMalloc(&d_buffer2, buffer_size));
-        CUDA_CHECK(cudaMalloc(&d_buffer3, buffer_size));
-        
-        // 创建CUDA流
-        CUDA_CHECK(cudaStreamCreate(&stream));
+  // 构造函数要求 R 为 2 的幂
+  MontMul(uint64_t R, uint64_t N) : R(R), N(N)
+  {
+    if (R == 0 || (R & (R - 1)) != 0)
+    {
+      throw std::invalid_argument("R must be a power of two");
     }
-    
-    ~OptimizedGpuNTT() {
-        CUDA_CHECK(cudaFree(d_buffer1));
-        CUDA_CHECK(cudaFree(d_buffer2));
-        CUDA_CHECK(cudaFree(d_buffer3));
-        CUDA_CHECK(cudaStreamDestroy(stream));
+    logR = static_cast<int>(std::log2(R));
+    if ((1ULL << logR) != R)
+    {
+      throw std::invalid_argument("R is not a power of two");
     }
-    
-    void ntt_transform(long long* d_data, int n, bool invert = false) {
-        int log_n = 0;
-        int temp = n;
-        while (temp > 1) {
-            log_n++;
-            temp >>= 1;
-        }
-        
-        // 位逆序排列
-        int block_size = min(256, n);
-        int grid_size = (n + block_size - 1) / block_size;
-        bit_reverse_permute<<<grid_size, block_size, 0, stream>>>(d_data, n, log_n);
-        
-        // NTT蝶形运算
-        for (int len = 2; len <= n; len <<= 1) {
-            // 计算本轮的n次单位根
-            long long wn = host_pow_mod(root, (mod - 1) / len, mod);
-            
-            int butterflies = n / 2;
-            int opt_block_size = min(256, butterflies);
-            int opt_grid_size = (butterflies + opt_block_size - 1) / opt_block_size;
-            
-            ntt_butterfly_kernel<<<opt_grid_size, opt_block_size, 0, stream>>>(
-                d_data, n, len, wn, invert
-            );
-        }
-        
-        // 如果是逆变换，乘以n的逆元
-        if (invert) {
-            long long inv_n = host_pow_mod(n, mod - 2, mod);
-            scalar_multiply<<<grid_size, block_size, 0, stream>>>(d_data, inv_n, n);
-        }
+    uint64_t N_inv = modinv(N, R);
+    N_inv_neg = R - N_inv;
+    __int128 R_squared = static_cast<__int128>(R) * R;
+    R2 = static_cast<uint64_t>(R_squared % N);
+  }
+
+  // 获取Montgomery参数，用于GPU计算
+  uint64_t getN() const { return N; }
+  uint64_t getR() const { return R; }
+  int getLogR() const { return logR; }
+  uint64_t getNInvNeg() const { return N_inv_neg; }
+  uint64_t getR2() const { return R2; }
+
+  // REDC 算法，将 __int128 类型的 T 转换为 Montgomery 域内元素
+  uint64_t REDC(__int128 T) const
+  {
+    uint64_t mask = (logR == 64) ? ~0ULL : ((1ULL << logR) - 1);
+    uint64_t m_part = static_cast<uint64_t>(T) & mask;
+    uint64_t m = (m_part * N_inv_neg) & mask;
+    __int128 mN = static_cast<__int128>(m) * N;
+    __int128 t_val = (T + mN) >> logR;
+    uint64_t t = static_cast<uint64_t>(t_val);
+    return t >= N ? t - N : t;
+  }
+
+  // 将普通整数转换到 Montgomery 域
+  uint64_t toMont(uint64_t a) const
+  {
+    return REDC(a * R2);
+  }
+
+  // 从 Montgomery 域转换回普通整数
+  uint64_t fromMont(uint64_t aR) const
+  {
+    return REDC(aR);
+  }
+
+  // 在 Montgomery 域内进行乘法运算
+  uint64_t mulMont(uint64_t aR, uint64_t bR) const
+  {
+    return REDC(aR * bR);
+  }
+
+  // 保持原有接口：对于 a, b（要求均小于模 N），返回 a * b mod N
+  uint64_t ModMul(uint64_t a, uint64_t b)
+  {
+    if (a >= N || b >= N)
+    {
+      throw std::invalid_argument("input must be smaller than modulus N");
     }
-    
-    void convolution(long long* h_a, long long* h_b, long long* h_result, int n) {
-        // 计算所需长度
-        int len = 1;
-        while (len < 2 * n) len <<= 1;
-        
-        size_t copy_size = n * sizeof(long long);
-        
-        // 异步复制数据到GPU并清零填充部分
-        CUDA_CHECK(cudaMemcpyAsync(d_buffer1, h_a, copy_size, cudaMemcpyHostToDevice, stream));
-        CUDA_CHECK(cudaMemcpyAsync(d_buffer2, h_b, copy_size, cudaMemcpyHostToDevice, stream));
-        
-        if (len > n) {
-            CUDA_CHECK(cudaMemsetAsync(d_buffer1 + n, 0, (len - n) * sizeof(long long), stream));
-            CUDA_CHECK(cudaMemsetAsync(d_buffer2 + n, 0, (len - n) * sizeof(long long), stream));
-        }
-        
-        // 前向NTT
-        ntt_transform(d_buffer1, len, false);
-        ntt_transform(d_buffer2, len, false);
-        
-        // 点乘
-        int block_size = 256;
-        int grid_size = (len + block_size - 1) / block_size;
-        pointwise_multiply<<<grid_size, block_size, 0, stream>>>(
-            d_buffer1, d_buffer2, d_buffer3, len
-        );
-        
-        // 逆NTT
-        ntt_transform(d_buffer3, len, true);
-        
-        // 复制结果回主机
-        size_t result_size = (2 * n - 1) * sizeof(long long);
-        CUDA_CHECK(cudaMemcpyAsync(h_result, d_buffer3, result_size, cudaMemcpyDeviceToHost, stream));
-        
-        // 等待所有操作完成
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-    }
+    uint64_t aR = toMont(a);
+    uint64_t bR = toMont(b);
+    uint64_t abR = mulMont(aR, bR);
+    return fromMont(abR);
+  }
 };
 
-// 辅助函数
-void fRead(int *a, int *b, int *n, int *p, int input_id) {
-    string str1 = "./nttdata/";
-    string str2 = to_string(input_id);
-    string strin = str1 + str2 + ".in";
-    char data_path[256];
-    strncpy(data_path, strin.c_str(), sizeof(data_path));
-    data_path[sizeof(data_path) - 1] = '\0';
-    ifstream fin;
-    fin.open(data_path, ios::in);
-    if (!fin) {
-        cerr << "无法打开输入文件: " << strin << endl;
-        return;
-    }
-    fin >> *n >> *p;
-    for (int i = 0; i < *n; ++i) {
-        fin >> a[i];
-    }
-    for (int i = 0; i < *n; ++i) {
-        fin >> b[i];
-    }
-    fin.close();
+// GPU版本的Montgomery乘法结构体
+struct DeviceMontMul {
+    uint64_t N;
+    uint64_t R;
+    int logR;
+    uint64_t N_inv_neg;
+    uint64_t R2;
+};
+
+// CUDA设备函数：REDC算法
+__device__ uint64_t device_REDC(unsigned __int128 T, const DeviceMontMul& mont) {
+    uint64_t mask = (mont.logR == 64) ? ~0ULL : ((1ULL << mont.logR) - 1);
+    uint64_t m_part = static_cast<uint64_t>(T) & mask;
+    uint64_t m = (m_part * mont.N_inv_neg) & mask;
+    unsigned __int128 mN = static_cast<unsigned __int128>(m) * mont.N;
+    unsigned __int128 t_val = (T + mN) >> mont.logR;
+    uint64_t t = static_cast<uint64_t>(t_val);
+    return t >= mont.N ? t - mont.N : t;
 }
 
-void fCheck(long long *ab, int n, int input_id) {
-    string str1 = "./nttdata/";
-    string str2 = to_string(input_id);
-    string strout = str1 + str2 + ".out";
-    char data_path[256];
-    strncpy(data_path, strout.c_str(), sizeof(data_path));
-    data_path[sizeof(data_path) - 1] = '\0';
-    ifstream fin;
-    fin.open(data_path, ios::in);
-    if (!fin) {
-        cerr << "无法打开输出文件: " << strout << endl;
-        return;
+// CUDA设备函数：转换到Montgomery域
+__device__ uint64_t device_toMont(uint64_t a, const DeviceMontMul& mont) {
+    return device_REDC(static_cast<unsigned __int128>(a) * mont.R2, mont);
+}
+
+// CUDA设备函数：从Montgomery域转换回来
+__device__ uint64_t device_fromMont(uint64_t aR, const DeviceMontMul& mont) {
+    return device_REDC(aR, mont);
+}
+
+// CUDA设备函数：Montgomery域内乘法
+__device__ uint64_t device_mulMont(uint64_t aR, uint64_t bR, const DeviceMontMul& mont) {
+    return device_REDC(static_cast<unsigned __int128>(aR) * bR, mont);
+}
+
+// Host函数：快速模幂
+long long quick_mod(long long a, long long b, long long p) {
+    long long result = 1;
+    a = a % p;
+    while (b > 0) {
+        if (b % 2 == 1) {
+            result = (result * a) % p;
+        }
+        a = (a * a) % p;
+        b /= 2;
+    }
+    return result;
+}
+
+// CUDA设备函数：快速模幂
+__device__ long long device_quick_mod(long long a, long long b, long long p) {
+    long long result = 1;
+    a = a % p;
+    while (b > 0) {
+        if (b % 2 == 1) {
+            result = (result * a) % p;
+        }
+        a = (a * a) % p;
+        b /= 2;
+    }
+    return result;
+}
+
+// GPU核函数：位反转重排
+__global__ void bit_reverse_kernel(long long* a, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    
+    int j = 0;
+    int temp_idx = idx;
+    int bit = n >> 1;
+    
+    while (bit > 0) {
+        if (temp_idx & 1) {
+            j |= bit;
+        }
+        temp_idx >>= 1;
+        bit >>= 1;
     }
     
-    bool correct = true;
-    for (int i = 0; i < n * 2 - 1; ++i) {
-        long long x;
-        fin >> x;
-        if (x != ab[i]) {
-            cout << "多项式乘法结果错误在位置 " << i << ": 期望 " << x << ", 得到 " << ab[i] << endl;
-            correct = false;
-            break;
+    if (idx < j) {
+        long long temp = a[idx];
+        a[idx] = a[j];
+        a[j] = temp;
+    }
+}
+
+// GPU核函数：NTT蝶形运算
+__global__ void ntt_butterfly_kernel(long long* a, int n, int len, long long wnR, 
+                                    int p, DeviceMontMul mont) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int half_len = len / 2;
+    int num_groups = n / len;
+    int total_operations = num_groups * half_len;
+    
+    if (idx >= total_operations) return;
+    
+    int group_id = idx / half_len;
+    int in_group_id = idx % half_len;
+    
+    int i = group_id * len + in_group_id;
+    int j = i + half_len;
+    
+    // 计算w^in_group_id，使用快速幂方法
+    long long w = device_toMont(1, mont);
+    if (in_group_id > 0) {
+        long long base = wnR;
+        int exp = in_group_id;
+        while (exp > 0) {
+            if (exp & 1) {
+                w = device_mulMont(w, base, mont);
+            }
+            base = device_mulMont(base, base, mont);
+            exp >>= 1;
         }
     }
-    if (correct) {
-        cout << "多项式乘法结果正确" << endl;
-    }
-    fin.close();
+    
+    long long u = a[i];
+    long long v = device_mulMont(w, a[j], mont);
+    
+    a[i] = (u + v) % p;
+    a[j] = (u - v + p) % p;
 }
 
-void fWrite(long long *ab, int n, int input_id) {
-    string str1 = "files/";
-    string str2 = to_string(input_id);
-    string strout = str1 + str2 + ".out";
-    char output_path[256];
-    strncpy(output_path, strout.c_str(), sizeof(output_path));
-    output_path[sizeof(output_path) - 1] = '\0';
-    ofstream fout;
-    fout.open(output_path, ios::out);
-    if (!fout) {
-        cerr << "无法打开输出文件用于写入: " << strout << endl;
-        return;
+// GPU核函数：点乘
+__global__ void pointwise_mul_kernel(long long* a, long long* b, long long* c, 
+                                   int n, DeviceMontMul mont) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        c[idx] = device_mulMont(a[idx], b[idx], mont);
     }
-    for (int i = 0; i < n * 2 - 1; ++i) {
-        fout << ab[i] << '\n';
-    }
-    fout.close();
 }
 
-// 全局数组
-int a[300000], b[300000];
-long long ab[300000];
-
-int main(int argc, char *argv[]) {
-    // GPU信息查询
-    int device_count;
-    CUDA_CHECK(cudaGetDeviceCount(&device_count));
-    cout << "发现 " << device_count << " 个CUDA设备" << endl;
-    
-    if (device_count == 0) {
-        cerr << "没有发现CUDA设备！" << endl;
-        return 1;
+// GPU核函数：最终结果归一化
+__global__ void normalize_kernel(long long* c, int n, long long invR, 
+                                DeviceMontMul mont) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        c[idx] = device_mulMont(c[idx], invR, mont);
     }
+}
+
+// GPU核函数：转换到Montgomery域
+__global__ void to_mont_kernel(long long* a, int n, DeviceMontMul mont) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        a[idx] = device_toMont(a[idx], mont);
+    }
+}
+
+// GPU核函数：从Montgomery域转换回来
+__global__ void from_mont_kernel(long long* a, int n, DeviceMontMul mont) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        a[idx] = device_fromMont(a[idx], mont);
+    }
+}
+
+// GPU版本的NTT
+void gpu_ntt_iter(long long* d_a, int n, int p, int root, bool invert, 
+                 const DeviceMontMul& mont, const MontMul& mont_cpu) {
     
-    // 设置GPU参数以提高性能
+    // 位反转重排
+    int threads_per_block = 256;
+    int blocks = (n + threads_per_block - 1) / threads_per_block;
+    bit_reverse_kernel<<<blocks, threads_per_block>>>(d_a, n);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    
+    // 迭代进行蝶形运算
+    for (int len = 2; len <= n; len <<= 1) {
+        long long wn = quick_mod(root, (p - 1) / len, p);
+        if (invert) {
+            wn = quick_mod(wn, p - 2, p);
+        }
+        
+        // 在CPU上计算wnR，然后传递给GPU
+        long long wnR = mont_cpu.toMont(wn);
+        
+        int half_len = len / 2;
+        int num_groups = n / len;
+        int total_operations = num_groups * half_len;
+        int blocks_butterfly = (total_operations + threads_per_block - 1) / threads_per_block;
+        
+        ntt_butterfly_kernel<<<blocks_butterfly, threads_per_block>>>(
+            d_a, n, len, wnR, p, mont);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+}
+
+vector<long long> gpu_get_result(vector<long long> &a, vector<long long> &b, 
+                                int p, int root, const MontMul &mont_cpu) {
+    int n = a.size();
+    
+    // 创建GPU版本的Montgomery乘法参数
+    DeviceMontMul mont;
+    mont.N = mont_cpu.getN();
+    mont.R = mont_cpu.getR();
+    mont.logR = mont_cpu.getLogR();
+    mont.N_inv_neg = mont_cpu.getNInvNeg();
+    mont.R2 = mont_cpu.getR2();
+    
+    // 分配GPU内存
+    long long *d_a, *d_b, *d_c;
+    CUDA_CHECK(cudaMalloc(&d_a, n * sizeof(long long)));
+    CUDA_CHECK(cudaMalloc(&d_b, n * sizeof(long long)));
+    CUDA_CHECK(cudaMalloc(&d_c, n * sizeof(long long)));
+    
+    // 复制数据到GPU
+    CUDA_CHECK(cudaMemcpy(d_a, a.data(), n * sizeof(long long), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, b.data(), n * sizeof(long long), cudaMemcpyHostToDevice));
+    
+    // GPU线程配置
+    int threads_per_block = 256;
+    int blocks = (n + threads_per_block - 1) / threads_per_block;
+    
+    // 前向NTT
+    gpu_ntt_iter(d_a, n, p, root, false, mont, mont_cpu);
+    gpu_ntt_iter(d_b, n, p, root, false, mont, mont_cpu);
+    
+    // 点乘
+    pointwise_mul_kernel<<<blocks, threads_per_block>>>(d_a, d_b, d_c, n, mont);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    
+    // 反向NTT
+    gpu_ntt_iter(d_c, n, p, root, true, mont, mont_cpu);
+    
+    // 归一化
+    long long inv_n = quick_mod(n, p - 2, p);
+    long long invR = mont_cpu.toMont(inv_n);
+    normalize_kernel<<<blocks, threads_per_block>>>(d_c, n, invR, mont);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    
+    // 复制结果回CPU
+    vector<long long> c(n);
+    CUDA_CHECK(cudaMemcpy(c.data(), d_c, n * sizeof(long long), cudaMemcpyDeviceToHost));
+    
+    // 释放GPU内存
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_b));
+    CUDA_CHECK(cudaFree(d_c));
+    
+    return c;
+}
+
+void fRead(int *a, int *b, int *n, int *p, int input_id)
+{
+  string str1 = "./nttdata/";
+  string str2 = to_string(input_id);
+  string strin = str1 + str2 + ".in";
+  char data_path[strin.size() + 1];
+  copy(strin.begin(), strin.end(), data_path);
+  data_path[strin.size()] = '\0';
+  ifstream fin;
+  fin.open(data_path, ios::in);
+  fin >> *n >> *p;
+  for (int i = 0; i < *n; ++i)
+  {
+    fin >> a[i];
+  }
+  for (int i = 0; i < *n; ++i)
+  {
+    fin >> b[i];
+  }
+  fin.close();
+}
+
+void fWrite(int *ab, int n, int input_id)
+{
+  string str1 = "files/";
+  string str2 = to_string(input_id);
+  string strout = str1 + str2 + ".out";
+  char output_path[strout.size() + 1];
+  copy(strout.begin(), strout.end(), output_path);
+  output_path[strout.size()] = '\0';
+  ofstream fout;
+  fout.open(output_path, ios::out);
+  for (int i = 0; i < n * 2 - 1; ++i)
+  {
+    fout << ab[i] << '\n';
+  }
+  fout.close();
+}
+
+void fCheck(int *ab, int n, int input_id)
+{
+  string str1 = "./nttdata/";
+  string str2 = to_string(input_id);
+  string strout = str1 + str2 + ".out";
+  char data_path[strout.size() + 1];
+  copy(strout.begin(), strout.end(), data_path);
+  data_path[strout.size()] = '\0';
+  ifstream fin;
+  fin.open(data_path, ios::in);
+  for (int i = 0; i < n * 2 - 1; ++i)
+  {
+    int x;
+    fin >> x;
+    if (x != ab[i])
+    {
+      cout << "多项式乘法结果错误" << endl;
+      fin.close();
+      return;
+    }
+  }
+  cout << "多项式乘法结果正确" << endl;
+  fin.close();
+}
+
+int a[300000], b[300000], ab[300000];
+
+int main(int argc, char *argv[])
+{
+    // 初始化CUDA设备
     CUDA_CHECK(cudaSetDevice(0));
-    CUDA_CHECK(cudaDeviceSetCacheConfig(cudaFuncCachePreferL1));
-    
-    cudaDeviceProp prop;
-    CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
-    cout << "\n使用GPU: " << prop.name << endl;
-    cout << "计算能力: " << prop.major << "." << prop.minor << endl;
-    cout << "SM数量: " << prop.multiProcessorCount << endl;
-    cout << endl;
     
     int test_begin = 0, test_end = 3;
-    
-    for (int id = test_begin; id <= test_end; ++id) {
+    for (int id = test_begin; id <= test_end; ++id)
+    {
+        double ans = 0;
         int n_, p_;
-        
-        // 读取输入
         fRead(a, b, &n_, &p_, id);
-        memset(ab, 0, sizeof(ab));
+
+        int len = 1;
+        while (len < 2 * n_)
+            len <<= 1;
+        fill(a + n_, a + len, 0);
+        fill(b + n_, b + len, 0);
+
+        vector<long long> va(a, a + len), vb(b, b + len);
+        long long R = 1LL << 30;
+        MontMul mont(R, p_);
         
-        // 创建优化的NTT实例
-        OptimizedGpuNTT ntt_engine(p_);
-        
-        // 转换输入数据类型
-        vector<long long> va(n_), vb(n_);
-        for (int i = 0; i < n_; i++) {
-            va[i] = a[i];
-            vb[i] = b[i];
+        // 转换到Montgomery域
+        for (int i = 0; i < len; ++i)
+        {
+            va[i] = mont.toMont(va[i]);
+            vb[i] = mont.toMont(vb[i]);
         }
-        
-        // 单次运行测试正确性
-        ntt_engine.convolution(va.data(), vb.data(), ab, n_);
-        CUDA_CHECK(cudaDeviceSynchronize());
-        
-        // 验证结果
-        fCheck(ab, n_, id);
-        
-        // 性能测试
+
+        int root = 3;
         auto start = chrono::high_resolution_clock::now();
-        
-        for (int iter = 0; iter < 10; iter++) {
-            // 重新准备数据
-            for (int i = 0; i < n_; i++) {
-                va[i] = a[i];
-                vb[i] = b[i];
-            }
-            ntt_engine.convolution(va.data(), vb.data(), ab, n_);
-        }
-        CUDA_CHECK(cudaDeviceSynchronize());
-        
+        vector<long long> cr = gpu_get_result(va, vb, p_, root, mont);
         auto end = chrono::high_resolution_clock::now();
-        double avg_time = chrono::duration<double, std::milli>(end - start).count() / 10.0;
-        
-        cout << "average latency for n = " << n_ << " p = " << p_ << " : " 
-             << fixed << setprecision(4) << avg_time << " us" << endl;
-        
-        // 写入结果
+        ans = chrono::duration<double, ratio<1, 1000>>(end - start).count();
+
+        for (int i = 0; i < 2 * n_ - 1; ++i)
+        {
+            ab[i] = (int)mont.fromMont(cr[i]);
+        }
+
+        fCheck(ab, n_, id);
+        cout << "GPU average latency for n = " << n_ << " p = " << p_ << " : " << ans << " (us)" << endl;
         fWrite(ab, n_, id);
     }
-    
     return 0;
 }
