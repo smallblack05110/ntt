@@ -462,8 +462,8 @@ int main(int argc, char *argv[])
     // 初始化CUDA设备
     CUDA_CHECK(cudaSetDevice(0));
     
-    int test_begin = 0, test_end = 3;
-    for (int id = test_begin; id <= test_end; ++id)
+    int test_begin = 3, test_end = 0;
+    for (int id = test_begin; id >= test_end; --id)
     {
         double ans = 0;
         int n_, p_;
